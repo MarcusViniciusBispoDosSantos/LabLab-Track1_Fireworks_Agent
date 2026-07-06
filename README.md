@@ -1,186 +1,315 @@
-# Track 1 Fireworks Agent — AMD Developer Hackathon ACT II
+# FireRoute AI
 
-Accuracy-first Docker project for **Track 1: General-Purpose AI Agent**.
+**Token-efficient general-purpose AI agent for AMD Developer Hackathon ACT II — Track 1.**
 
-The final submission is a Docker image. It must:
+FireRoute AI is a Dockerized Python agent that reads natural language tasks from `/input/tasks.json`, solves each prompt using Fireworks AI through the hackathon runtime environment, and writes valid answers to `/output/results.json`.
 
-- read `/input/tasks.json` on startup
-- write `/output/results.json` before exiting
-- read `FIREWORKS_API_KEY`, `FIREWORKS_BASE_URL`, and `ALLOWED_MODELS` from environment variables
-- use the harness-provided `FIREWORKS_API_KEY`, not a key bundled by you
-- route all Fireworks calls through `FIREWORKS_BASE_URL`
-- never hardcode model IDs; choose only from `ALLOWED_MODELS`
-- support all 8 Track 1 capability categories
+This project is designed for **Track 1: General-Purpose AI Agent**.
 
-## Important: you do not need the final API key
+---
 
-For the real hackathon evaluation, the judging harness injects:
+## Project Links
 
-```text
-FIREWORKS_API_KEY
-FIREWORKS_BASE_URL
-ALLOWED_MODELS
+**Public GitHub Repository**  
+https://github.com/MarcusViniciusBispoDosSantos/LabLab-Track1_Fireworks_Agent
+
+**Application URL / Demo URL**  
+https://github.com/MarcusViniciusBispoDosSantos/LabLab-Track1_Fireworks_Agent
+
+**Docker Image**  
+```bash
+ghcr.io/marcusviniciusbispodossantos/fireroute-ai:latest
 ```
 
-This project reads those values at runtime. Do not place a real `.env` file in the Docker image.
+> Note: This Track 1 project is evaluated as a Docker container, not as a hosted web application. The repository contains the Dockerfile, setup instructions, GitHub Actions validation, and the public `linux/amd64` container image reference.
 
-## Supported categories
+---
+
+## What It Does
+
+FireRoute AI handles all required Track 1 task categories:
 
 1. Factual knowledge
 2. Mathematical reasoning
 3. Sentiment classification
-4. Text summarisation
+4. Text summarization
 5. Named entity recognition
 6. Code debugging
 7. Logical / deductive reasoning
 8. Code generation
 
-## Project structure
+The agent uses task routing, compact prompt templates, dynamic model selection from `ALLOWED_MODELS`, and structured JSON output.
 
-```text
-.
-├── Dockerfile
-├── requirements.txt
-├── src/
-│   ├── agent.py
-│   ├── classifier.py
-│   ├── main.py
-│   ├── models.py
-│   └── prompts.py
-├── samples/
-│   ├── tasks.json
-│   └── tasks_all_categories.json
-├── scripts/
-│   ├── build_push.sh
-│   ├── mock_fireworks.py
-│   ├── run_local.sh
-│   ├── test_with_mock.sh
-│   └── validate_results.py
-└── .github/workflows/
-    └── track1-online-check.yml
-```
+---
 
-## Fastest confirmation without a real Fireworks key
+## Track 1 Contract
 
-This checks the Docker contract using a local mock harness. It confirms the image builds, reads `/input/tasks.json`, uses the environment variables, calls `FIREWORKS_BASE_URL`, writes `/output/results.json`, and produces valid JSON.
+The container follows the official Track 1 input/output contract.
+
+### Input
+
+On startup, the container reads:
 
 ```bash
-./scripts/test_with_mock.sh
+/input/tasks.json
 ```
 
-This does **not** confirm real model accuracy. It confirms the submission shape and harness compatibility.
-
-## Online confirmation with GitHub Actions
-
-Push this repo to GitHub. The included workflow runs automatically on `main`, or you can start it manually from:
-
-```text
-GitHub repo → Actions → Track 1 Online Check → Run workflow
-```
-
-The workflow builds the `linux/amd64` Docker image, starts a mock Fireworks-compatible server, runs the container like the judge, validates `output/results.json`, checks the image architecture, and confirms `.env` is not inside the image.
-
-## Local development with a real Fireworks key, optional
-
-Only needed if you want to test real answer accuracy before official submission.
-
-```bash
-cp .env.example .env
-```
-
-Then edit `.env` with your own Fireworks values:
-
-```env
-FIREWORKS_API_KEY=your_local_fireworks_key
-FIREWORKS_BASE_URL=https://api.fireworks.ai/inference/v1
-ALLOWED_MODELS=accounts/fireworks/models/example-model-1,accounts/fireworks/models/example-model-2
-```
-
-Run:
-
-```bash
-python -m src.main
-cat ./samples/results.json
-python scripts/validate_results.py --tasks samples/tasks_all_categories.json --results samples/results.json
-```
-
-## Expected input
+Example:
 
 ```json
 [
-  { "task_id": "t1", "prompt": "Summarise the following text in one sentence: ..." },
-  { "task_id": "t2", "prompt": "..." }
+  {
+    "task_id": "t1",
+    "prompt": "Summarise the following text in one sentence: ..."
+  },
+  {
+    "task_id": "t2",
+    "prompt": "Solve: 15% of 240 plus 18."
+  }
 ]
 ```
 
-## Expected output
+### Output
+
+Before exiting, the container writes:
+
+```bash
+/output/results.json
+```
+
+Example:
 
 ```json
 [
-  { "task_id": "t1", "answer": "..." },
-  { "task_id": "t2", "answer": "..." }
+  {
+    "task_id": "t1",
+    "answer": "..."
+  },
+  {
+    "task_id": "t2",
+    "answer": "..."
+  }
 ]
 ```
 
-## Docker build for submission
+---
 
-The judging VM runs `linux/amd64`, so build and push with an amd64 manifest.
+## Runtime Environment Variables
+
+The final hackathon judging harness injects these variables at runtime:
 
 ```bash
-./scripts/build_push.sh your-dockerhub-user/track1-fireworks-agent:latest
+FIREWORKS_API_KEY
+FIREWORKS_BASE_URL
+ALLOWED_MODELS
 ```
 
-Equivalent command:
+The submitted container must read them from the environment.
+
+The project does **not** hardcode API keys or model IDs.
+
+All Fireworks calls are routed through:
+
+```bash
+FIREWORKS_BASE_URL
+```
+
+Local `.env` files are only for development and must not be committed.
+
+---
+
+## Docker Image Requirement
+
+The judging VM runs on:
+
+```bash
+linux/amd64
+```
+
+The image must include a `linux/amd64` manifest.
+
+Recommended build command:
 
 ```bash
 docker buildx build \
   --platform linux/amd64 \
-  --tag your-dockerhub-user/track1-fireworks-agent:latest \
+  --tag ghcr.io/marcusviniciusbispodossantos/fireroute-ai:latest \
   --push \
   .
 ```
 
-## Manual judge-style Docker run
+For GitHub Actions, use:
+
+```yaml
+platforms: linux/amd64
+```
+
+---
+
+## Pull the Public Docker Image
+
+```bash
+docker pull ghcr.io/marcusviniciusbispodossantos/fireroute-ai:latest
+```
+
+---
+
+## Run Example
+
+Create input/output folders:
 
 ```bash
 mkdir -p input output
-cp samples/tasks_all_categories.json input/tasks.json
-
-# With real Fireworks values in .env, or with the mock server running.
-docker run --rm \
-  --env-file .env \
-  -v "$PWD/input:/input" \
-  -v "$PWD/output:/output" \
-  track1-fireworks-agent:local
-
-python scripts/validate_results.py --tasks input/tasks.json --results output/results.json
-cat output/results.json
 ```
 
-## Accuracy knobs
+Create `input/tasks.json`:
 
-Default mode uses one specialized model call per task. This is usually the best balance for the 10-minute runtime and token-efficiency ranking.
+```json
+[
+  {
+    "task_id": "math1",
+    "prompt": "A company has 1,200 users. It grows by 15% and then loses 8%. How many users remain?"
+  },
+  {
+    "task_id": "sentiment1",
+    "prompt": "Classify the sentiment: The dashboard is fast and clean, but the export button fails every time."
+  }
+]
+```
 
-For maximum accuracy on hard tasks, enable a verifier call:
+Run the container:
 
 ```bash
-VERIFY_HARD_TASKS=1
+docker run --rm \
+  -e FIREWORKS_API_KEY="provided-by-harness" \
+  -e FIREWORKS_BASE_URL="provided-by-harness" \
+  -e ALLOWED_MODELS="provided-by-harness" \
+  -v "$PWD/input:/input" \
+  -v "$PWD/output:/output" \
+  ghcr.io/marcusviniciusbispodossantos/fireroute-ai:latest
 ```
 
-This can help math, logic, debugging, and code-generation tasks, but it uses more tokens and time. Because Track 1 ranks passing submissions by token efficiency, use it carefully.
+For official evaluation, the hackathon harness provides the real values for `FIREWORKS_API_KEY`, `FIREWORKS_BASE_URL`, and `ALLOWED_MODELS`.
 
-## Compliance checklist
+---
 
-Before submitting, confirm:
+## Online Validation with GitHub Actions
 
-- `docker buildx build --platform linux/amd64` succeeds
-- image architecture is `amd64`
-- `.env` is not copied into the image
-- container reads `/input/tasks.json`
-- container writes valid `/output/results.json`
-- every output item has `task_id` and `answer`
-- app exits with code `0` on success
-- no hardcoded API key
-- no hardcoded model IDs for final judging
-- every Fireworks call uses `FIREWORKS_BASE_URL`
-- public image can be pulled by the judge
+This repository includes GitHub Actions workflows to validate the project online without requiring Docker on a local machine.
+
+The online check confirms:
+
+- Docker image builds successfully
+- Container starts correctly
+- `/input/tasks.json` is read
+- `/output/results.json` is written
+- Output JSON is valid
+- All `task_id` values receive answers
+- Environment variables are accepted
+- Image is built for `linux/amd64`
+
+To run the online check:
+
+1. Open the repository on GitHub.
+2. Go to **Actions**.
+3. Select the Track 1 validation workflow.
+4. Click **Run workflow**.
+5. Confirm the workflow completes successfully.
+
+---
+
+## Repository Structure
+
+```text
+.
+├── .github/
+│   └── workflows/
+├── Dockerfile
+├── README.md
+├── requirements.txt
+├── src/
+│   ├── main.py
+│   ├── agent.py
+│   ├── classifier.py
+│   ├── models.py
+│   └── prompts.py
+├── scripts/
+│   ├── mock_fireworks.py
+│   ├── test_with_mock.sh
+│   └── validate_results.py
+└── samples/
+    └── tasks_all_categories.json
+```
+
+---
+
+## Security Notes
+
+Do not commit:
+
+```bash
+.env
+input/
+output/
+__pycache__/
+```
+
+The final submission must not include a real Fireworks API key.
+
+---
+
+## lablab.ai Submission Values
+
+### Project Title
+
+```text
+FireRoute AI
+```
+
+### Short Description
+
+```text
+FireRoute AI is a Dockerized general-purpose AI agent for AMD Developer Hackathon Track 1. It reads tasks from /input/tasks.json, routes them through Fireworks AI using harness-provided environment variables, and writes valid answers to /output/results.json.
+```
+
+### Long Description
+
+```text
+FireRoute AI is a Dockerized general-purpose AI agent built for Track 1 of the AMD Developer Hackathon ACT II. It processes batches of natural language tasks by reading `/input/tasks.json`, solving each prompt, and writing valid answers to `/output/results.json` before the container exits.
+
+The agent is designed to handle all required Track 1 capability areas: factual knowledge, mathematical reasoning, sentiment classification, text summarization, named entity recognition, code debugging, logical reasoning, and code generation. Its architecture uses lightweight task routing and task-specific prompting to improve accuracy while keeping responses concise.
+
+FireRoute AI follows the official Fireworks AI runtime contract. It does not hardcode API keys or model IDs. Instead, it reads `FIREWORKS_API_KEY`, `FIREWORKS_BASE_URL`, and `ALLOWED_MODELS` from the judging harness environment and routes all model calls through the provided base URL.
+
+The project is fully containerized and includes GitHub Actions validation to confirm the Docker contract online. The final image is intended to be built for `linux/amd64`, publicly pullable, and ready for automated evaluation. FireRoute AI focuses on passing the accuracy gate first, then improving token efficiency through compact prompts, dynamic model selection, and structured JSON output.
+```
+
+### Technology Tags
+
+```text
+Python, Docker, Fireworks AI, AMD, AI Agent, LLM, Prompt Engineering, GitHub Actions, JSON, Containerized Application, Task Routing, Natural Language Processing
+```
+
+### Demo Application Platform
+
+```text
+GitHub / Docker / GitHub Container Registry
+```
+
+### Application URL
+
+```text
+https://github.com/MarcusViniciusBispoDosSantos/LabLab-Track1_Fireworks_Agent
+```
+
+### Docker Image
+
+```text
+ghcr.io/marcusviniciusbispodossantos/fireroute-ai:latest
+```
+
+---
+
+## Final Submission Note
+
+FireRoute AI is submitted as a public `linux/amd64` Docker image. It reads `FIREWORKS_API_KEY`, `FIREWORKS_BASE_URL`, and `ALLOWED_MODELS` from the judging harness environment, reads tasks from `/input/tasks.json`, and writes valid results to `/output/results.json`.
