@@ -17,7 +17,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Run Docker contract test with mock harness
-        run: ./scripts/test_with_mock.sh track1-fireworks-agent:ci
+        run: bash scripts/test_with_mock.sh track1-fireworks-agent:ci
 
       - name: Confirm image architecture
         run: |
