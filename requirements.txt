@@ -1,0 +1,2 @@
+# No third-party runtime dependencies.
+# The agent calls the Fireworks OpenAI-compatible endpoint using Python stdlib.

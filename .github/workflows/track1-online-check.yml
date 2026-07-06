@@ -1,0 +1,30 @@
+name: Track 1 Online Check
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  docker-contract-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Run Docker contract test with mock harness
+        run: ./scripts/test_with_mock.sh track1-fireworks-agent:ci
+
+      - name: Confirm image architecture
+        run: |
+          ARCH=$(docker image inspect track1-fireworks-agent:ci --format '{{.Architecture}}')
+          echo "Architecture: $ARCH"
+          test "$ARCH" = "amd64"
+
+      - name: Confirm .env is not inside image
+        run: |
+          docker run --rm track1-fireworks-agent:ci sh -c 'test ! -f /app/.env && echo OK_NO_ENV_FILE'

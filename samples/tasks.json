@@ -1,0 +1,18 @@
+[
+  {
+    "task_id": "math1",
+    "prompt": "A shop discounts a $120 jacket by 25%, then adds 8% sales tax. What is the final price?"
+  },
+  {
+    "task_id": "sent1",
+    "prompt": "Classify the sentiment and briefly justify it: The app looks beautiful, but it crashes every time I try to upload a file."
+  },
+  {
+    "task_id": "sum1",
+    "prompt": "Summarise in one sentence: Kubernetes is an open-source system for automating deployment, scaling, and management of containerized applications. It groups containers into logical units and provides mechanisms for service discovery, load balancing, rollout, rollback, and self-healing."
+  },
+  {
+    "task_id": "ner1",
+    "prompt": "Extract named entities and label them: On July 4, 2026, Maria Santos joined AMD in Austin, Texas."
+  }
+]
