@@ -13,7 +13,20 @@ MOCK_PID=$!
 cleanup() {
   kill "$MOCK_PID" >/dev/null 2>&1 || true
 }
-trap cleanup EXIT
+show_debug() {
+  status=$?
+  if [ "$status" -ne 0 ]; then
+    echo "--- mock Fireworks log ---"
+    cat /tmp/mock_fireworks_track1.log || true
+    echo "--- output directory ---"
+    ls -la output || true
+    echo "--- output/results.json ---"
+    cat output/results.json || true
+  fi
+  cleanup
+  exit "$status"
+}
+trap show_debug EXIT
 sleep 1
 
 docker buildx build \

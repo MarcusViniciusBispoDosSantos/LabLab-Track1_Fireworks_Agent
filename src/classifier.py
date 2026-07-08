@@ -54,11 +54,14 @@ def classify_task(prompt: str) -> TaskType:
     ]):
         return TaskType.SENTIMENT
 
+    # Summary detection must require an explicit summarization intent.
+    # Do NOT route prompts like "Explain HTTP in two sentences" to SUMMARY;
+    # those are factual tasks with a length constraint.
     if any(k in low for k in [
         "summarize", "summarise", "summary", "tl;dr", "tldr", "condense", "recap",
-        "one-sentence", "one sentence", "two-sentence", "bullet summary", "key points",
-        "main idea", "in 1 sentence", "in one sentence", "in two sentences", "in 3 bullets",
-        "in three bullets", "shorten the following", "compress the following",
+        "bullet summary", "key points", "main idea", "shorten the following",
+        "compress the following", "summarise the following", "summarize the following",
+        "summarise this", "summarize this", "summarise the text", "summarize the text",
     ]):
         return TaskType.SUMMARY
 

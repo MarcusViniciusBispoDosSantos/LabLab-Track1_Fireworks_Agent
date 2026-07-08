@@ -161,7 +161,7 @@ ghcr.io/marcusviniciusbispodossantos/fireroute-ai:latest
 
 ## Long Description
 
-FireRoute AI is a Dockerized general-purpose AI agent built for Track 1 of the AMD Developer Hackathon ACT II. It processes batches of natural language tasks by reading `/input/tasks.json`, solving each prompt, and writing valid answers to `/output/results.json` before the container exits.
+FireRoute AI accuracy v3.1 is a Dockerized general-purpose AI agent built for Track 1 of the AMD Developer Hackathon ACT II. It processes batches of natural language tasks by reading `/input/tasks.json`, solving each prompt, and writing valid answers to `/output/results.json` before the container exits.
 
 The agent is designed to handle all required Track 1 capability areas: factual knowledge, mathematical reasoning, sentiment classification, text summarization, named entity recognition, code debugging, logical reasoning, and code generation. Its architecture uses lightweight task routing, task-specific prompting, verification, and dynamic model selection from the harness-provided `ALLOWED_MODELS` to improve correctness.
 
