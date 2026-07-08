@@ -48,7 +48,7 @@ jobs:
           docker buildx imagetools inspect ${{ steps.vars.outputs.image }}:latest
           docker buildx imagetools inspect ${{ steps.vars.outputs.image }}:latest | grep -q "linux/amd64"
 
-      - name: Confirm final image URL
+      - name: Final image URL
         run: |
           echo "Docker image ready:"
           echo "${{ steps.vars.outputs.image }}:latest"

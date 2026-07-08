@@ -28,3 +28,24 @@ jobs:
       - name: Confirm .env is not inside image
         run: |
           docker run --rm track1-fireworks-agent:ci sh -c 'test ! -f /app/.env && echo OK_NO_ENV_FILE'
+
+      - name: Run classifier sanity check
+        run: |
+          python - <<'PY'
+          from src.classifier import classify_task, TaskType
+          cases = {
+              TaskType.FACTUAL: "Explain what HTTP is in two sentences.",
+              TaskType.MATH: "A company has 1200 users and grows 15% then loses 8%. How many users remain?",
+              TaskType.SENTIMENT: "Classify the sentiment: The app is fast but crashes often.",
+              TaskType.SUMMARY: "Summarize the following text in one sentence: Cloud computing rents infrastructure.",
+              TaskType.NER: "Extract named entities: Maria joined AMD in Austin on July 4, 2026.",
+              TaskType.CODE_DEBUG: "Find and fix the bug in this Python function:\ndef f(nums):\n return len(num)",
+              TaskType.LOGIC: "Alice, Bob, and Carla each own one pet. Alice does not own the dog. Who owns each pet?",
+              TaskType.CODE_GEN: "Write a Python function called is_palindrome(text).",
+          }
+          for expected, prompt in cases.items():
+              actual = classify_task(prompt)
+              print(expected, actual)
+              assert actual == expected, (expected, actual, prompt)
+          print("PASS_CLASSIFIER_SANITY")
+          PY

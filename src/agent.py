@@ -11,7 +11,8 @@ from typing import Any
 
 from .classifier import TaskType, classify_task
 from .models import parse_allowed_models, ranked_models
-from .prompts import TASK_SYSTEMS, VERIFIER_SYSTEM
+from .prompts import REFORMAT_SYSTEM, TASK_SYSTEMS, VERIFIER_SYSTEM
+from .solvers import try_solve_locally
 
 
 @dataclass(frozen=True)
@@ -21,7 +22,8 @@ class AgentConfig:
     allowed_models: list[str]
     request_timeout_seconds: float = 28.0
     max_retries: int = 2
-    verify_hard_tasks: bool = False
+    verify_mode: str = "all"  # none | hard | all
+    local_fast_paths: bool = True
 
     @classmethod
     def from_env(cls) -> "AgentConfig":
@@ -32,7 +34,13 @@ class AgentConfig:
 
         timeout = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "28"))
         retries = int(os.getenv("MAX_RETRIES", "2"))
-        verify = os.getenv("VERIFY_HARD_TASKS", "0").strip().lower() in {"1", "true", "yes", "on"}
+        legacy_verify = os.getenv("VERIFY_HARD_TASKS", "").strip().lower()
+        verify_mode = os.getenv("VERIFY_MODE", "all").strip().lower()
+        if legacy_verify in {"0", "false", "no", "off"} and "VERIFY_MODE" not in os.environ:
+            verify_mode = "none"
+        if verify_mode not in {"none", "hard", "all"}:
+            verify_mode = "all"
+        local_fast_paths = os.getenv("ENABLE_LOCAL_FAST_PATHS", "1").strip().lower() in {"1", "true", "yes", "on"}
 
         return cls(
             api_key=os.environ["FIREWORKS_API_KEY"],
@@ -40,7 +48,8 @@ class AgentConfig:
             allowed_models=parse_allowed_models(os.environ["ALLOWED_MODELS"]),
             request_timeout_seconds=timeout,
             max_retries=max(0, retries),
-            verify_hard_tasks=verify,
+            verify_mode=verify_mode,
+            local_fast_paths=local_fast_paths,
         )
 
 
@@ -55,35 +64,53 @@ class FireworksTrack1Agent:
             return {"task_id": task_id, "answer": ""}
 
         task_type = classify_task(prompt)
+
+        if self.config.local_fast_paths:
+            local = try_solve_locally(prompt, task_type)
+            if local:
+                return {"task_id": task_id, "answer": _clean_answer(local, task_type)}
+
         answer = self._generate_answer(prompt, task_type)
 
-        if self.config.verify_hard_tasks and task_type in {
-            TaskType.MATH,
-            TaskType.LOGIC,
-            TaskType.CODE_DEBUG,
-            TaskType.CODE_GEN,
-        }:
+        if self._should_verify(task_type):
             try:
                 answer = self._verify_answer(prompt, answer, task_type)
             except Exception:
-                # Keep the original answer if verification fails; malformed/missing output is worse.
+                # Keeping a generated answer is better than returning a failure string.
                 pass
 
-        return {"task_id": task_id, "answer": _clean_answer(answer, task_type)}
+        # A very light final format pass helps with verbose models, while avoiding a
+        # third model call for normal cases.
+        answer = _clean_answer(answer, task_type)
+        return {"task_id": task_id, "answer": answer}
+
+    def _should_verify(self, task_type: TaskType) -> bool:
+        if self.config.verify_mode == "none":
+            return False
+        if self.config.verify_mode == "all":
+            return True
+        return task_type in {TaskType.MATH, TaskType.LOGIC, TaskType.CODE_DEBUG, TaskType.CODE_GEN}
 
     def _generate_answer(self, prompt: str, task_type: TaskType) -> str:
         messages = [
             {"role": "system", "content": TASK_SYSTEMS[task_type]},
-            {"role": "user", "content": prompt},
+            {"role": "user", "content": _task_user_message(prompt, task_type)},
         ]
         return self._call_best_available(messages, task_type, _max_tokens_for(task_type))
 
     def _verify_answer(self, prompt: str, draft: str, task_type: TaskType) -> str:
         messages = [
             {"role": "system", "content": VERIFIER_SYSTEM},
-            {"role": "user", "content": f"Original task:\n{prompt}\n\nDraft answer:\n{draft}"},
+            {"role": "user", "content": f"Original task category: {task_type.value}\n\nOriginal task:\n{prompt}\n\nDraft answer:\n{draft}"},
         ]
-        return self._call_best_available(messages, task_type, _max_tokens_for(task_type))
+        return self._call_best_available(messages, task_type, _verify_max_tokens_for(task_type))
+
+    def _reformat_answer(self, prompt: str, draft: str, task_type: TaskType) -> str:
+        messages = [
+            {"role": "system", "content": REFORMAT_SYSTEM},
+            {"role": "user", "content": f"Original task:\n{prompt}\n\nAnswer to format:\n{draft}"},
+        ]
+        return self._call_best_available(messages, task_type, _verify_max_tokens_for(task_type))
 
     def _call_best_available(
         self,
@@ -97,12 +124,9 @@ class FireworksTrack1Agent:
 
         last_error: Exception | None = None
         attempts = 0
-        max_attempts = max(1, self.config.max_retries + 1)
+        max_attempts = max(1, min(len(candidates), self.config.max_retries + 1))
 
-        # Try strongest-ranked allowed models first. Never use a model outside ALLOWED_MODELS.
-        for model in candidates[: max(3, max_attempts)]:
-            if attempts >= max_attempts:
-                break
+        for model in candidates[:max_attempts]:
             attempts += 1
             try:
                 content = self._chat_completion(
@@ -115,17 +139,12 @@ class FireworksTrack1Agent:
                 last_error = RuntimeError(f"Empty response from {model}")
             except Exception as exc:
                 last_error = exc
-                time.sleep(min(0.8 * attempts, 2.0))
+                time.sleep(min(0.6 * attempts, 1.8))
 
         raise RuntimeError(f"All model attempts failed. Last error: {last_error}")
 
     def _chat_completion(self, model: str, messages: list[dict[str, str]], max_tokens: int) -> str:
-        """Call Fireworks through FIREWORKS_BASE_URL using only Python stdlib.
-
-        The harness records token usage through this base URL, so every request must go
-        through config.base_url. No model ID is hardcoded; `model` always comes from
-        ALLOWED_MODELS.
-        """
+        """Call Fireworks through FIREWORKS_BASE_URL using only Python stdlib."""
         url = _chat_completions_url(self.config.base_url)
         payload = {
             "model": model,
@@ -134,7 +153,7 @@ class FireworksTrack1Agent:
             "top_p": 1,
             "max_tokens": max_tokens,
         }
-        data = json.dumps(payload).encode("utf-8")
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(
             url,
             data=data,
@@ -151,22 +170,45 @@ class FireworksTrack1Agent:
                 raw = resp.read().decode("utf-8")
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"HTTP {exc.code} from Fireworks proxy: {body[:500]}") from exc
+            raise RuntimeError(f"HTTP {exc.code} from Fireworks proxy: {body[:700]}") from exc
 
         parsed = json.loads(raw)
         choices = parsed.get("choices") or []
         if not choices:
-            raise RuntimeError(f"No choices in response: {raw[:500]}")
+            raise RuntimeError(f"No choices in response: {raw[:700]}")
         first = choices[0]
-        message = first.get("message") if isinstance(first, dict) else None
+        if not isinstance(first, dict):
+            raise RuntimeError(f"Malformed choice: {raw[:700]}")
+
+        message = first.get("message")
         if isinstance(message, dict):
             content = message.get("content")
             if isinstance(content, str):
                 return content
-        text = first.get("text") if isinstance(first, dict) else None
+            if isinstance(content, list):
+                parts: list[str] = []
+                for item in content:
+                    if isinstance(item, dict):
+                        if isinstance(item.get("text"), str):
+                            parts.append(item["text"])
+                        elif item.get("type") == "text" and isinstance(item.get("content"), str):
+                            parts.append(item["content"])
+                    elif isinstance(item, str):
+                        parts.append(item)
+                if parts:
+                    return "\n".join(parts)
+        text = first.get("text")
         if isinstance(text, str):
             return text
-        raise RuntimeError(f"Could not parse assistant content: {raw[:500]}")
+        raise RuntimeError(f"Could not parse assistant content: {raw[:700]}")
+
+
+def _task_user_message(prompt: str, task_type: TaskType) -> str:
+    return (
+        f"Task category: {task_type.value}\n"
+        "Solve the original task below. Follow its requested output format exactly.\n\n"
+        f"Original task:\n{prompt}"
+    )
 
 
 def _chat_completions_url(base_url: str) -> str:
@@ -178,23 +220,59 @@ def _chat_completions_url(base_url: str) -> str:
 
 def _max_tokens_for(task_type: TaskType) -> int:
     return {
-        TaskType.FACTUAL: 550,
-        TaskType.MATH: 550,
-        TaskType.SENTIMENT: 180,
-        TaskType.SUMMARY: 260,
-        TaskType.NER: 380,
-        TaskType.CODE_DEBUG: 1100,
-        TaskType.LOGIC: 650,
-        TaskType.CODE_GEN: 1400,
+        TaskType.FACTUAL: 650,
+        TaskType.MATH: 750,
+        TaskType.SENTIMENT: 220,
+        TaskType.SUMMARY: 320,
+        TaskType.NER: 520,
+        TaskType.CODE_DEBUG: 1400,
+        TaskType.LOGIC: 850,
+        TaskType.CODE_GEN: 1700,
+    }[task_type]
+
+
+def _verify_max_tokens_for(task_type: TaskType) -> int:
+    return {
+        TaskType.FACTUAL: 650,
+        TaskType.MATH: 700,
+        TaskType.SENTIMENT: 220,
+        TaskType.SUMMARY: 320,
+        TaskType.NER: 520,
+        TaskType.CODE_DEBUG: 1400,
+        TaskType.LOGIC: 850,
+        TaskType.CODE_GEN: 1700,
     }[task_type]
 
 
 def _clean_answer(answer: str, task_type: TaskType) -> str:
     text = answer.strip()
-    text = re.sub(r"^\s*(final answer|answer)\s*:\s*", "", text, flags=re.IGNORECASE)
+    text = _remove_thinking(text)
+    text = re.sub(r"^\s*(final answer|answer|result)\s*:\s*", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"^\s*Here is (?:the )?", "", text, flags=re.IGNORECASE).strip()
+
     if task_type == TaskType.CODE_GEN:
         text = _strip_single_code_fence(text)
+        text = re.sub(
+            r"^(?:the )?(?:Python|JavaScript|TypeScript|Java|C\+\+|SQL)?\s*code(?: is)?:?\s*",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        ).strip()
     return text.strip()
+
+
+def _remove_thinking(text: str) -> str:
+    # Reasoning models may emit <think>...</think>. The final answer usually follows.
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.IGNORECASE | re.DOTALL).strip()
+    if "</think>" in text.lower():
+        # Remove anything before the last closing tag.
+        parts = re.split(r"</think>", text, flags=re.IGNORECASE)
+        text = parts[-1].strip()
+    if text.lower().startswith("<think>"):
+        # If a model emitted an unclosed think block, try to keep content after a blank line.
+        chunks = re.split(r"\n\s*\n", text, maxsplit=1)
+        text = chunks[1].strip() if len(chunks) > 1 else text
+    return text
 
 
 def _strip_single_code_fence(text: str) -> str:

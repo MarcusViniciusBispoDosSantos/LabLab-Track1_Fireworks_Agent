@@ -9,7 +9,7 @@
   },
   {
     "task_id": "sentiment1",
-    "prompt": "Classify the sentiment as positive, negative, neutral, or mixed: The dashboard is fast and clean, but the export button fails every time."
+    "prompt": "Classify the sentiment and justify briefly: The dashboard is fast and clean, but the export button fails every time."
   },
   {
     "task_id": "summary1",
