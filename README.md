@@ -1,5 +1,18 @@
 # FireRoute AI
 
+## Accuracy v5 update
+
+This version is accuracy-first because the official feedback said the previous container ran but did not pass the minimum accuracy threshold. v5 changes the defaults to:
+
+- `VERIFY_MODE=all` for a second correction pass on every task.
+- `ENABLE_LOCAL_FAST_PATHS=0` so hidden benchmark prompts are solved by the strongest allowed Fireworks model rather than regex shortcuts.
+- `MAX_WORKERS=2` to reduce proxy/rate-limit failures during evaluation.
+- Higher output token limits for math, logic, debugging, and code generation.
+- Stronger model ranking from `ALLOWED_MODELS`, including reasoning-capable models when they are provided by the harness.
+
+The final container still reads `FIREWORKS_API_KEY`, `FIREWORKS_BASE_URL`, and `ALLOWED_MODELS` from the environment, reads `/input/tasks.json`, and writes `/output/results.json`.
+
+
 FireRoute AI is an accuracy-first, Dockerized Track 1 agent for the AMD Developer Hackathon ACT II. It reads tasks from `/input/tasks.json`, solves them through Fireworks AI using the judging harness environment, and writes valid answers to `/output/results.json`.
 
 ## Track 1 Contract

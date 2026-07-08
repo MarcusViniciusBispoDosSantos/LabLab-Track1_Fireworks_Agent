@@ -10,8 +10,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from .classifier import TaskType, classify_task
-from .models import parse_allowed_models, ranked_models
-from .prompts import REFORMAT_SYSTEM, TASK_SYSTEMS, VERIFIER_SYSTEM
+from .models import is_thinking_model, parse_allowed_models, ranked_models
+from .prompts import TASK_SYSTEMS, VERIFIER_SYSTEM
 from .solvers import try_solve_locally
 
 
@@ -20,10 +20,10 @@ class AgentConfig:
     api_key: str
     base_url: str
     allowed_models: list[str]
-    request_timeout_seconds: float = 28.0
-    max_retries: int = 2
-    verify_mode: str = "hard"  # none | hard | all
-    local_fast_paths: bool = True
+    request_timeout_seconds: float = 29.0
+    max_retries: int = 3
+    verify_mode: str = "all"  # none | hard | all
+    local_fast_paths: bool = False
 
     @classmethod
     def from_env(cls) -> "AgentConfig":
@@ -32,15 +32,18 @@ class AgentConfig:
         if missing:
             raise RuntimeError("Missing required environment variable(s): " + ", ".join(missing))
 
-        timeout = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "28"))
-        retries = int(os.getenv("MAX_RETRIES", "2"))
+        timeout = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "29"))
+        retries = int(os.getenv("MAX_RETRIES", "3"))
         legacy_verify = os.getenv("VERIFY_HARD_TASKS", "").strip().lower()
-        verify_mode = os.getenv("VERIFY_MODE", "hard").strip().lower()
+        verify_mode = os.getenv("VERIFY_MODE", "all").strip().lower()
         if legacy_verify in {"0", "false", "no", "off"} and "VERIFY_MODE" not in os.environ:
             verify_mode = "none"
         if verify_mode not in {"none", "hard", "all"}:
-            verify_mode = "hard"
-        local_fast_paths = os.getenv("ENABLE_LOCAL_FAST_PATHS", "1").strip().lower() in {"1", "true", "yes", "on"}
+            verify_mode = "all"
+
+        # v5 default: let the strongest LLM solve tasks. Regex fast paths are useful for
+        # smoke tests, but hidden benchmark prompts are varied, so they are opt-in.
+        local_fast_paths = os.getenv("ENABLE_LOCAL_FAST_PATHS", "0").strip().lower() in {"1", "true", "yes", "on"}
 
         return cls(
             api_key=os.environ["FIREWORKS_API_KEY"],
@@ -65,39 +68,32 @@ class FireworksTrack1Agent:
 
         task_type = classify_task(prompt)
 
+        # Opt-in only. Hidden evaluation is diverse; model answer is safer by default.
         if self.config.local_fast_paths:
             local = try_solve_locally(prompt, task_type)
             if local:
-                return {"task_id": task_id, "answer": _clean_answer(local, task_type)}
+                return {"task_id": task_id, "answer": _clean_answer(local, task_type, prompt)}
 
-        answer = self._generate_answer(prompt, task_type)
+        try:
+            answer = self._generate_answer(prompt, task_type)
+        except Exception:
+            # Route failures can happen with unusual prompts; retry with universal route.
+            answer = self._generate_answer(prompt, TaskType.FACTUAL)
 
         if self._should_verify(task_type):
             try:
                 answer = self._verify_answer(prompt, answer, task_type)
             except Exception:
-                # Keeping a generated answer is better than returning a failure string.
+                # Keeping the original generated answer is better than emitting an error string.
                 pass
 
-        # A very light final format pass helps with verbose models, while avoiding a
-        # third model call for normal cases.
-        answer = _clean_answer(answer, task_type)
-        if not answer.strip():
-            # Last-resort retry with a simpler, generic prompt. Empty answers often come
-            # from reasoning models whose final answer was not emitted.
+        answer = _clean_answer(answer, task_type, prompt)
+        if not answer:
             try:
-                answer = _clean_answer(self._generate_generic_answer(prompt), task_type)
+                answer = _clean_answer(self._generate_answer(prompt, TaskType.FACTUAL), task_type, prompt)
             except Exception:
-                answer = "Unable to produce a final answer."
+                answer = "No answer produced."
         return {"task_id": task_id, "answer": answer}
-
-
-    def _generate_generic_answer(self, prompt: str) -> str:
-        messages = [
-            {"role": "system", "content": "Solve the task accurately. Output only the final answer. Follow the requested format exactly."},
-            {"role": "user", "content": prompt},
-        ]
-        return self._call_best_available(messages, TaskType.FACTUAL, 900)
 
     def _should_verify(self, task_type: TaskType) -> bool:
         if self.config.verify_mode == "none":
@@ -120,13 +116,6 @@ class FireworksTrack1Agent:
         ]
         return self._call_best_available(messages, task_type, _verify_max_tokens_for(task_type))
 
-    def _reformat_answer(self, prompt: str, draft: str, task_type: TaskType) -> str:
-        messages = [
-            {"role": "system", "content": REFORMAT_SYSTEM},
-            {"role": "user", "content": f"Original task:\n{prompt}\n\nAnswer to format:\n{draft}"},
-        ]
-        return self._call_best_available(messages, task_type, _verify_max_tokens_for(task_type))
-
     def _call_best_available(
         self,
         messages: list[dict[str, str]],
@@ -138,15 +127,29 @@ class FireworksTrack1Agent:
             raise RuntimeError("No usable models found in ALLOWED_MODELS")
 
         last_error: Exception | None = None
-        attempts = 0
         max_attempts = max(1, min(len(candidates), self.config.max_retries + 1))
 
-        for model in candidates[:max_attempts]:
-            attempts += 1
+        for attempts, model in enumerate(candidates[:max_attempts], start=1):
             try:
+                model_max_tokens = max_tokens
+                if is_thinking_model(model):
+                    model_max_tokens = min(max(max_tokens, 1800), 3200)
                 content = self._chat_completion(
                     model=model,
                     messages=messages,
+                    max_tokens=model_max_tokens,
+                )
+                cleaned = _remove_thinking(content).strip()
+                if cleaned:
+                    return cleaned
+                # If thinking output consumed the whole answer, try the same model once with
+                # a stricter final-only instruction and a smaller token budget.
+                content = self._chat_completion(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": "Return only the final answer. No reasoning, no explanation unless requested."},
+                        messages[-1],
+                    ],
                     max_tokens=max_tokens,
                 )
                 if content.strip():
@@ -154,7 +157,8 @@ class FireworksTrack1Agent:
                 last_error = RuntimeError(f"Empty response from {model}")
             except Exception as exc:
                 last_error = exc
-                time.sleep(min(0.6 * attempts, 1.8))
+                # Back off for transient 429/5xx proxy errors.
+                time.sleep(min(0.8 * attempts, 3.0))
 
         raise RuntimeError(f"All model attempts failed. Last error: {last_error}")
 
@@ -220,8 +224,9 @@ class FireworksTrack1Agent:
 
 def _task_user_message(prompt: str, task_type: TaskType) -> str:
     return (
-        f"Task category: {task_type.value}\n"
-        "Solve the original task below. Follow its requested output format exactly.\n\n"
+        f"Route hint: {task_type.value}\n"
+        "Solve the original task below. The route hint may be wrong; the original task is authoritative. "
+        "Return only the final answer in the requested format.\n\n"
         f"Original task:\n{prompt}"
     )
 
@@ -235,36 +240,37 @@ def _chat_completions_url(base_url: str) -> str:
 
 def _max_tokens_for(task_type: TaskType) -> int:
     return {
-        TaskType.FACTUAL: 420,
-        TaskType.MATH: 560,
-        TaskType.SENTIMENT: 140,
-        TaskType.SUMMARY: 260,
-        TaskType.NER: 420,
-        TaskType.CODE_DEBUG: 1200,
-        TaskType.LOGIC: 650,
-        TaskType.CODE_GEN: 1500,
+        TaskType.FACTUAL: 700,
+        TaskType.MATH: 1000,
+        TaskType.SENTIMENT: 240,
+        TaskType.SUMMARY: 450,
+        TaskType.NER: 700,
+        TaskType.CODE_DEBUG: 1800,
+        TaskType.LOGIC: 1200,
+        TaskType.CODE_GEN: 2200,
     }[task_type]
 
 
 def _verify_max_tokens_for(task_type: TaskType) -> int:
     return {
-        TaskType.FACTUAL: 420,
-        TaskType.MATH: 520,
-        TaskType.SENTIMENT: 140,
-        TaskType.SUMMARY: 260,
-        TaskType.NER: 420,
-        TaskType.CODE_DEBUG: 1200,
-        TaskType.LOGIC: 650,
-        TaskType.CODE_GEN: 1500,
+        TaskType.FACTUAL: 650,
+        TaskType.MATH: 900,
+        TaskType.SENTIMENT: 220,
+        TaskType.SUMMARY: 420,
+        TaskType.NER: 650,
+        TaskType.CODE_DEBUG: 1800,
+        TaskType.LOGIC: 1100,
+        TaskType.CODE_GEN: 2200,
     }[task_type]
 
 
-def _clean_answer(answer: str, task_type: TaskType) -> str:
+def _clean_answer(answer: str, task_type: TaskType, prompt: str = "") -> str:
     text = answer.strip()
     text = _remove_thinking(text)
     text = re.sub(r"^\s*(final answer|answer|result)\s*:\s*", "", text, flags=re.IGNORECASE).strip()
     text = re.sub(r"^\s*Here is (?:the )?", "", text, flags=re.IGNORECASE).strip()
 
+    # Remove surrounding single markdown fence when code-only is requested.
     if task_type == TaskType.CODE_GEN:
         text = _strip_single_code_fence(text)
         text = re.sub(
@@ -273,18 +279,27 @@ def _clean_answer(answer: str, task_type: TaskType) -> str:
             text,
             flags=re.IGNORECASE,
         ).strip()
+
+    # If the model returns a quoted JSON/code block with extra lead-in, prefer fenced code.
+    if task_type in {TaskType.CODE_GEN, TaskType.CODE_DEBUG}:
+        fenced = re.search(r"```(?:[a-zA-Z0-9_+\-.#]*)?\s*\n(?P<code>.*?)\n```", text, flags=re.DOTALL)
+        if fenced and ("return code" in prompt.lower() or task_type == TaskType.CODE_GEN):
+            text = fenced.group("code").strip()
+
     return text.strip()
 
 
 def _remove_thinking(text: str) -> str:
-    # Reasoning models may emit <think>...</think>. The final answer usually follows.
+    text = text.strip()
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.IGNORECASE | re.DOTALL).strip()
     if "</think>" in text.lower():
-        # Remove anything before the last closing tag.
         parts = re.split(r"</think>", text, flags=re.IGNORECASE)
         text = parts[-1].strip()
     if text.lower().startswith("<think>"):
-        # If a model emitted an unclosed think block, try to keep content after a blank line.
+        # Prefer an explicit final answer marker if present.
+        m = re.search(r"(?:final answer|answer)\s*:\s*(.*)$", text, flags=re.IGNORECASE | re.DOTALL)
+        if m:
+            return m.group(1).strip()
         chunks = re.split(r"\n\s*\n", text, maxsplit=1)
         text = chunks[1].strip() if len(chunks) > 1 else text
     return text

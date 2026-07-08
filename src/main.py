@@ -65,7 +65,7 @@ def main() -> int:
         config = AgentConfig.from_env()
         agent = FireworksTrack1Agent(config)
 
-        max_workers = int(os.getenv("MAX_WORKERS", "4"))
+        max_workers = int(os.getenv("MAX_WORKERS", "2"))
         max_workers = max(1, min(max_workers, 8, len(tasks) or 1))
 
         indexed_results: list[tuple[int, dict[str, str]]] = []
@@ -82,7 +82,7 @@ def main() -> int:
                     except Exception as exc:
                         # Per-task fallback keeps the whole submission from producing malformed/missing JSON.
                         task_id = str(tasks[idx].get("task_id", f"task_{idx}"))
-                        indexed_results.append((idx, {"task_id": task_id, "answer": f"Unable to complete task: {exc}"}))
+                        indexed_results.append((idx, {"task_id": task_id, "answer": "Unable to produce a reliable answer."}))
 
         indexed_results.sort(key=lambda x: x[0])
         _write_results(output_path, [r for _, r in indexed_results])
