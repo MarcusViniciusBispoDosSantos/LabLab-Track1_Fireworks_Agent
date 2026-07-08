@@ -1,38 +1,37 @@
 # FireRoute AI
 
-FireRoute AI is an accuracy-first, Dockerized Track 1 agent for the AMD Developer Hackathon ACT II. It reads natural language tasks from `/input/tasks.json`, solves each prompt using Fireworks AI through the hackathon harness, and writes valid answers to `/output/results.json`.
+FireRoute AI is an accuracy-first, Dockerized Track 1 agent for the AMD Developer Hackathon ACT II. It reads tasks from `/input/tasks.json`, solves them through Fireworks AI using the judging harness environment, and writes valid answers to `/output/results.json`.
 
 ## Track 1 Contract
 
-The submitted container:
+The container:
 
 - reads `/input/tasks.json` on startup
 - writes `/output/results.json` before exiting
 - reads `FIREWORKS_API_KEY` from the environment
 - reads `FIREWORKS_BASE_URL` from the environment
 - reads `ALLOWED_MODELS` from the environment
-- sends all Fireworks calls through `FIREWORKS_BASE_URL`
+- routes all Fireworks calls through `FIREWORKS_BASE_URL`
 - does not hardcode API keys or final model IDs
-- builds as `linux/amd64`
+- is built as `linux/amd64`
 
-## Accuracy v3 Updates
+## Accuracy v4 Updates
 
-This version is optimized after a minimum-accuracy-threshold failure.
+This version is optimized after the official feedback: **the agent ran but did not pass the minimum accuracy threshold**.
 
-Improvements:
+v4 changes:
 
-- stronger task routing for all 8 Track 1 categories
-- accuracy-first system prompts
-- verification enabled for all task types by default through `VERIFY_MODE=all`
-- better model ranking from the injected `ALLOWED_MODELS`
-- safe local fast paths for obvious arithmetic, sentiment, and simple debug cases
-- improved parsing of Fireworks/OpenAI-compatible responses
-- stronger cleanup of reasoning-model `<think>` output
-- GitHub Actions contract validation and GHCR publishing workflow
+- avoids reasoning models by default because they can consume the output budget in hidden reasoning
+- uses stronger non-reasoning model ranking from `ALLOWED_MODELS`
+- adds a universal Track 1 prompt so a routing mistake is less damaging
+- verifies only hard tasks by default: math, logic, code debugging, and code generation
+- adds deterministic fast paths for common math, sentiment, code generation, debugging, NER, and simple assignment-logic patterns
+- keeps output compact and removes `<think>...</think>` content from final answers
+- includes GitHub Actions checks and GHCR publish workflow
 
 ## Required Capability Areas
 
-FireRoute AI supports:
+FireRoute AI supports all Track 1 capability categories:
 
 1. factual knowledge
 2. mathematical reasoning
@@ -67,7 +66,7 @@ FireRoute AI supports:
 
 ## Environment Variables
 
-The official judging harness injects these values at runtime:
+The official judging harness injects:
 
 ```bash
 FIREWORKS_API_KEY
@@ -78,33 +77,41 @@ ALLOWED_MODELS
 Optional tuning variables:
 
 ```bash
-VERIFY_MODE=all                 # all | hard | none
-ENABLE_LOCAL_FAST_PATHS=1       # safe deterministic solvers for obvious cases
-MAX_WORKERS=2
+VERIFY_MODE=hard                 # none | hard | all
+ENABLE_LOCAL_FAST_PATHS=1        # deterministic solvers for obvious cases
+ALLOW_THINKING_MODELS=0          # keep R1/reasoning models as fallback only
+MAX_WORKERS=3
 MAX_RETRIES=2
-REQUEST_TIMEOUT_SECONDS=28
+REQUEST_TIMEOUT_SECONDS=26
 ```
 
-## Local Mock Test
+## Online Contract Test
 
-This test does not require a real Fireworks API key. It confirms the Docker contract using a mock Fireworks-compatible server.
+Use GitHub Actions:
+
+```text
+Actions → Track 1 Online Check → Run workflow
+```
+
+This builds the image, runs a mock Fireworks-compatible harness, validates `/output/results.json`, and confirms the image works with env variables.
+
+## Build and Publish linux/amd64 Image
+
+The judging VM runs `linux/amd64`; the final image must include a `linux/amd64` manifest.
+
+Use the included workflow:
+
+```text
+Actions → Publish Docker Image to GHCR → Run workflow
+```
+
+Expected public image:
 
 ```bash
-bash scripts/test_with_mock.sh track1-fireworks-agent:local
+ghcr.io/marcusviniciusbispodossantos/fireroute-ai:latest
 ```
 
-It confirms that the image:
-
-- builds successfully
-- runs as a container
-- reads `/input/tasks.json`
-- writes `/output/results.json`
-- produces valid JSON
-- uses the environment variables
-
-## Build for linux/amd64
-
-The judging VM runs `linux/amd64`. The final image must include a `linux/amd64` manifest.
+Manual equivalent:
 
 ```bash
 docker buildx build \
@@ -114,55 +121,22 @@ docker buildx build \
   .
 ```
 
-## GitHub Actions
+## lablab.ai Submission URLs
 
-Two workflows are included:
-
-```text
-.github/workflows/track1-online-check.yml
-.github/workflows/publish-docker-ghcr.yml
-```
-
-Use **Track 1 Online Check** to validate the Docker contract online.
-
-Use **Publish Docker Image to GHCR** to build and push the public `linux/amd64` image.
-
-Final image reference:
-
-```text
-ghcr.io/marcusviniciusbispodossantos/fireroute-ai:latest
-```
-
-## lablab.ai Submission Values
-
-**Project Title**
-
-```text
-FireRoute AI
-```
-
-**Public GitHub Repository**
+Public GitHub Repository:
 
 ```text
 https://github.com/MarcusViniciusBispoDosSantos/LabLab-Track1_Fireworks_Agent
 ```
 
-**Application URL**
+Application URL if the form requires an HTTPS URL:
 
 ```text
 https://github.com/MarcusViniciusBispoDosSantos/LabLab-Track1_Fireworks_Agent
 ```
 
-**Docker Image**
+Docker image reference:
 
 ```text
 ghcr.io/marcusviniciusbispodossantos/fireroute-ai:latest
 ```
-
-## Long Description
-
-FireRoute AI accuracy v3.1 is a Dockerized general-purpose AI agent built for Track 1 of the AMD Developer Hackathon ACT II. It processes batches of natural language tasks by reading `/input/tasks.json`, solving each prompt, and writing valid answers to `/output/results.json` before the container exits.
-
-The agent is designed to handle all required Track 1 capability areas: factual knowledge, mathematical reasoning, sentiment classification, text summarization, named entity recognition, code debugging, logical reasoning, and code generation. Its architecture uses lightweight task routing, task-specific prompting, verification, and dynamic model selection from the harness-provided `ALLOWED_MODELS` to improve correctness.
-
-FireRoute AI follows the official Fireworks AI runtime contract. It does not hardcode API keys or final model IDs. Instead, it reads `FIREWORKS_API_KEY`, `FIREWORKS_BASE_URL`, and `ALLOWED_MODELS` from the judging harness environment and routes all model calls through the provided base URL. The final image is built for `linux/amd64`, publicly pullable, and ready for automated evaluation.

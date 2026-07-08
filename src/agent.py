@@ -22,7 +22,7 @@ class AgentConfig:
     allowed_models: list[str]
     request_timeout_seconds: float = 28.0
     max_retries: int = 2
-    verify_mode: str = "all"  # none | hard | all
+    verify_mode: str = "hard"  # none | hard | all
     local_fast_paths: bool = True
 
     @classmethod
@@ -35,11 +35,11 @@ class AgentConfig:
         timeout = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "28"))
         retries = int(os.getenv("MAX_RETRIES", "2"))
         legacy_verify = os.getenv("VERIFY_HARD_TASKS", "").strip().lower()
-        verify_mode = os.getenv("VERIFY_MODE", "all").strip().lower()
+        verify_mode = os.getenv("VERIFY_MODE", "hard").strip().lower()
         if legacy_verify in {"0", "false", "no", "off"} and "VERIFY_MODE" not in os.environ:
             verify_mode = "none"
         if verify_mode not in {"none", "hard", "all"}:
-            verify_mode = "all"
+            verify_mode = "hard"
         local_fast_paths = os.getenv("ENABLE_LOCAL_FAST_PATHS", "1").strip().lower() in {"1", "true", "yes", "on"}
 
         return cls(
@@ -82,7 +82,22 @@ class FireworksTrack1Agent:
         # A very light final format pass helps with verbose models, while avoiding a
         # third model call for normal cases.
         answer = _clean_answer(answer, task_type)
+        if not answer.strip():
+            # Last-resort retry with a simpler, generic prompt. Empty answers often come
+            # from reasoning models whose final answer was not emitted.
+            try:
+                answer = _clean_answer(self._generate_generic_answer(prompt), task_type)
+            except Exception:
+                answer = "Unable to produce a final answer."
         return {"task_id": task_id, "answer": answer}
+
+
+    def _generate_generic_answer(self, prompt: str) -> str:
+        messages = [
+            {"role": "system", "content": "Solve the task accurately. Output only the final answer. Follow the requested format exactly."},
+            {"role": "user", "content": prompt},
+        ]
+        return self._call_best_available(messages, TaskType.FACTUAL, 900)
 
     def _should_verify(self, task_type: TaskType) -> bool:
         if self.config.verify_mode == "none":
@@ -220,27 +235,27 @@ def _chat_completions_url(base_url: str) -> str:
 
 def _max_tokens_for(task_type: TaskType) -> int:
     return {
-        TaskType.FACTUAL: 650,
-        TaskType.MATH: 750,
-        TaskType.SENTIMENT: 220,
-        TaskType.SUMMARY: 320,
-        TaskType.NER: 520,
-        TaskType.CODE_DEBUG: 1400,
-        TaskType.LOGIC: 850,
-        TaskType.CODE_GEN: 1700,
+        TaskType.FACTUAL: 420,
+        TaskType.MATH: 560,
+        TaskType.SENTIMENT: 140,
+        TaskType.SUMMARY: 260,
+        TaskType.NER: 420,
+        TaskType.CODE_DEBUG: 1200,
+        TaskType.LOGIC: 650,
+        TaskType.CODE_GEN: 1500,
     }[task_type]
 
 
 def _verify_max_tokens_for(task_type: TaskType) -> int:
     return {
-        TaskType.FACTUAL: 650,
-        TaskType.MATH: 700,
-        TaskType.SENTIMENT: 220,
-        TaskType.SUMMARY: 320,
-        TaskType.NER: 520,
-        TaskType.CODE_DEBUG: 1400,
-        TaskType.LOGIC: 850,
-        TaskType.CODE_GEN: 1700,
+        TaskType.FACTUAL: 420,
+        TaskType.MATH: 520,
+        TaskType.SENTIMENT: 140,
+        TaskType.SUMMARY: 260,
+        TaskType.NER: 420,
+        TaskType.CODE_DEBUG: 1200,
+        TaskType.LOGIC: 650,
+        TaskType.CODE_GEN: 1500,
     }[task_type]
 
 
