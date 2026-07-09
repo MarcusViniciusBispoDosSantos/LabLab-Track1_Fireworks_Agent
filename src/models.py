@@ -1,10 +1,12 @@
-"""Model selection from ALLOWED_MODELS for Track 1.
+"""Robust model selection from ALLOWED_MODELS.
 
-The code never hardcodes model IDs for use. It only ranks whatever model IDs are
-provided by the judging harness in ALLOWED_MODELS.
+No model ID is hardcoded for execution; this only ranks whatever the harness
+provides. v8 mixes harness order with name-based quality heuristics because the
+allowed list may already be ordered by the organizers.
 """
 from __future__ import annotations
 
+import os
 import re
 from .classifier import TaskType
 
@@ -20,36 +22,50 @@ def parse_allowed_models(raw: str) -> list[str]:
     return list(dict.fromkeys(models))
 
 
+def usable_models(models: list[str]) -> list[str]:
+    usable = [m for m in models if not any(bad in m.lower() for bad in _BAD_MODEL_HINTS)]
+    return usable or models[:]
+
+
 def ranked_models(models: list[str], task_type: TaskType) -> list[str]:
-    usable = [m for m in models if not any(bad in m.lower() for bad in _BAD_MODEL_HINTS)] or models[:]
-    return sorted(usable, key=lambda m: _score_model(m, task_type), reverse=True)
+    forced = os.getenv("FORCE_MODEL", "").strip()
+    usable = usable_models(models)
+    if forced and forced in usable:
+        return [forced] + [m for m in usable if m != forced]
+    # Preserve harness order as a meaningful signal: earlier models get a small bonus.
+    order_index = {m: i for i, m in enumerate(usable)}
+    return sorted(usable, key=lambda m: (_score_model(m, task_type) - order_index.get(m, 0) * 7), reverse=True)
 
 
-def diverse_models(models: list[str], task_type: TaskType, limit: int = 3) -> list[str]:
-    """Return a small, diverse set for ensemble solving.
+def primary_models(models: list[str], task_type: TaskType, limit: int = 3) -> list[str]:
+    """Return a small set of strong candidates.
 
-    We avoid selecting three near-identical model IDs from one family when a
-    different strong family is available.
+    Includes both the best ranked model and the first harness-provided usable
+    model when different. This protects against inaccurate name heuristics.
     """
+    usable = usable_models(models)
     ranked = ranked_models(models, task_type)
     out: list[str] = []
-    seen_family: set[str] = set()
-    for model in ranked:
-        fam = _family(model)
-        if fam not in seen_family:
-            out.append(model)
-            seen_family.add(fam)
-        if len(out) >= limit:
-            return out
+    if ranked:
+        out.append(ranked[0])
+    if usable and usable[0] not in out:
+        out.append(usable[0])
     for model in ranked:
         if model not in out:
-            out.append(model)
+            # Avoid three almost identical variants if possible.
+            if _family(model) not in {_family(x) for x in out} or len(out) < 2:
+                out.append(model)
         if len(out) >= limit:
             break
+    for model in ranked:
+        if len(out) >= limit:
+            break
+        if model not in out:
+            out.append(model)
     return out
 
 
-def best_selector_model(models: list[str], task_type: TaskType) -> str | None:
+def verifier_model(models: list[str], task_type: TaskType) -> str | None:
     ranked = ranked_models(models, task_type)
     return ranked[0] if ranked else None
 
@@ -74,7 +90,6 @@ def _family(model_id: str) -> str:
     for fam in ["kimi", "deepseek-r1", "deepseek", "qwen", "gpt-oss", "llama", "mistral", "mixtral", "gemma"]:
         if fam in m:
             return fam
-    # fallback to last path segment without size/version suffixes
     last = m.split("/")[-1]
     return re.sub(r"[-_]?\d+(?:\.\d+)?b.*", "", last) or last
 
@@ -83,55 +98,51 @@ def _score_model(model_id: str, task_type: TaskType) -> float:
     m = model_id.lower()
     score = 0.0
 
-    # Avoid non-chat/base models.
-    if "instruct" in m: score += 180
-    if "chat" in m: score += 120
-    if "turbo" in m: score += 30
-    if "base" in m or "pretrain" in m: score -= 320
-    if "draft" in m or "spec" in m: score -= 120
+    if any(bad in m for bad in _BAD_MODEL_HINTS): score -= 10000
+    if "instruct" in m: score += 220
+    if "chat" in m: score += 150
+    if "turbo" in m: score += 40
+    if "base" in m or "pretrain" in m: score -= 500
+    if "draft" in m or "spec" in m: score -= 180
 
     size_b = _largest_b_size(m)
     if size_b:
-        score += min(size_b, 405) * 0.7
+        score += min(size_b, 405) * 0.8
 
-    # Strong current families. These are only name-based priorities among models
-    # already allowed by the harness.
-    family_bonus = [
-        ("kimi-k2", 260), ("deepseek-v3", 245), ("qwen3-235", 240),
-        ("qwen3", 210), ("qwen2.5", 175), ("qwen2p5", 175),
-        ("gpt-oss-120b", 215), ("gpt-oss", 170),
-        ("llama-4", 165), ("llama-v3.3", 155), ("llama-v3p3", 155), ("llama", 115),
-        ("mistral-large", 120), ("mistral", 80), ("mixtral", 75), ("gemma", 65),
-        ("deepseek-r1", 150), ("deepseek", 130),
+    bonuses = [
+        ("kimi-k2", 330), ("deepseek-v3", 310), ("qwen3-235", 305), ("qwen3", 260),
+        ("gpt-oss-120b", 285), ("gpt-oss", 225),
+        ("qwen2.5", 220), ("qwen2p5", 220),
+        ("llama-4", 210), ("llama-v3.3", 195), ("llama-v3p3", 195), ("llama", 145),
+        ("mistral-large", 150), ("mistral", 95), ("mixtral", 90), ("gemma", 80),
+        ("deepseek-r1", 230), ("deepseek", 185),
     ]
-    for hint, value in family_bonus:
+    for hint, val in bonuses:
         if hint in m:
-            score += value
+            score += val
 
     if task_type in {TaskType.CODE_GEN, TaskType.CODE_DEBUG}:
-        if "coder" in m or "code" in m: score += 320
-        if "qwen" in m: score += 130
-        if "kimi" in m: score += 120
-        if "deepseek" in m: score += 110
-    elif task_type in {TaskType.MATH, TaskType.LOGIC}:
-        if is_thinking_model(m): score += 160
-        if "qwen" in m: score += 150
+        if "coder" in m or "code" in m: score += 420
+        if "qwen" in m: score += 170
         if "deepseek" in m: score += 150
-        if "gpt-oss" in m: score += 95
-        if "kimi" in m: score += 90
-    elif task_type in {TaskType.SUMMARY, TaskType.NER, TaskType.SENTIMENT}:
-        if "llama" in m: score += 120
-        if "gpt-oss" in m: score += 110
-        if "qwen" in m: score += 100
-        if "kimi" in m: score += 95
+        if "kimi" in m: score += 140
+    elif task_type in {TaskType.MATH, TaskType.LOGIC}:
+        if is_thinking_model(m): score += 270
+        if "qwen" in m: score += 180
+        if "deepseek" in m: score += 175
+        if "gpt-oss" in m: score += 130
+        if "kimi" in m: score += 120
+    elif task_type in {TaskType.NER, TaskType.SUMMARY, TaskType.SENTIMENT}:
+        # These usually benefit from instruction-following stability over long reasoning.
+        if "llama" in m: score += 160
+        if "gpt-oss" in m: score += 155
+        if "qwen" in m: score += 140
+        if "kimi" in m: score += 130
+        if is_thinking_model(m): score -= 120
     else:
-        if "gpt-oss" in m: score += 120
-        if "llama" in m: score += 115
-        if "qwen" in m: score += 105
-        if "kimi" in m: score += 100
-        if "deepseek" in m: score += 95
-
-    # For non-reasoning tasks, reasoning models often waste budget and can format poorly.
-    if is_thinking_model(m) and task_type not in {TaskType.MATH, TaskType.LOGIC}:
-        score -= 100
+        if "gpt-oss" in m: score += 160
+        if "llama" in m: score += 150
+        if "qwen" in m: score += 140
+        if "kimi" in m: score += 135
+        if "deepseek" in m: score += 120
     return score

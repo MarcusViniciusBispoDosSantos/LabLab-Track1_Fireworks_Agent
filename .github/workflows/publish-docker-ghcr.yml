@@ -43,12 +43,12 @@ jobs:
             ${{ steps.vars.outputs.image }}:latest
             ${{ steps.vars.outputs.image }}:${{ github.sha }}
 
-      - name: Inspect image manifest
+      - name: Inspect linux/amd64 manifest
         run: |
           docker buildx imagetools inspect ${{ steps.vars.outputs.image }}:latest
           docker buildx imagetools inspect ${{ steps.vars.outputs.image }}:latest | grep -q "linux/amd64"
 
-      - name: Final image URL
+      - name: Confirm final image URL
         run: |
           echo "Docker image ready:"
           echo "${{ steps.vars.outputs.image }}:latest"
