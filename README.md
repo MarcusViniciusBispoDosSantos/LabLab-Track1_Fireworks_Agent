@@ -1,18 +1,17 @@
-# FireRoute AI — Track 1 Accuracy v9 Target-85
+# FireRoute AI — Track 1 Accuracy v10
 
-FireRoute AI is a Dockerized Track 1 agent for the AMD Developer Hackathon ACT II.
-It reads `/input/tasks.json`, solves each natural language task using Fireworks AI through the harness-provided environment, and writes `/output/results.json`.
+FireRoute AI is a Dockerized Track 1 agent for the AMD Developer Hackathon ACT II. It reads `/input/tasks.json`, solves each natural language task using Fireworks AI through the harness-provided environment, and writes `/output/results.json`.
 
-## Why v9 changed
+## Why v10 exists
 
-Previous versions ran correctly but reached only ~63.2% hidden accuracy. v9 changes the strategy:
+Previous builds improved the container but plateaued around 63.2% hidden accuracy. v10 changes the strategy again:
 
-- Uses the original benchmark prompt directly; no internal task wrapping.
-- Runs a tiny model-calibration step to pick the strongest model from `ALLOWED_MODELS` in the actual harness.
-- Uses high-confidence deterministic solvers only for simple exact cases.
-- Avoids full verifier passes on every task because they can corrupt good answers or exceed runtime.
-- Repairs only clearly invalid outputs such as malformed JSON or missing requested code signatures.
-- Keeps output concise and preserves strict format requirements.
+- Category-specific model calibration from `ALLOWED_MODELS`.
+- Original prompt is still sent directly to the model.
+- A self-check/correction pass is enabled for maximum correctness.
+- Local shortcut solvers are disabled by default to avoid hidden benchmark mismatches.
+- Stronger prompt rules for exact formats, code signatures, JSON, units, and labels.
+- `linux/amd64` GHCR publish workflow is included.
 
 ## Official Track 1 contract
 
@@ -48,24 +47,18 @@ docker buildx build \
 
 ## Runtime configuration
 
-Official judging injects these values. Do not commit a real `.env` file.
+Official judging injects the three Fireworks variables. Do not commit a real `.env` file.
+
+v10 accuracy-first defaults:
 
 ```bash
-FIREWORKS_API_KEY=<provided by harness>
-FIREWORKS_BASE_URL=<provided by harness>
-ALLOWED_MODELS=<provided by harness>
-```
-
-v9 defaults:
-
-```bash
-ENABLE_MODEL_CALIBRATION=1
+ENABLE_LOCAL_FAST_PATHS=0
+ENABLE_CATEGORY_CALIBRATION=1
 CALIBRATION_MODEL_LIMIT=4
-ENABLE_LOCAL_FAST_PATHS=1
-RETRY_INVALID_OUTPUTS=1
-MAX_WORKERS=3
-MAX_RETRIES=5
-REQUEST_TIMEOUT_SECONDS=26
+SELF_CHECK_MODE=all
+MAX_WORKERS=2
+MAX_RETRIES=6
+REQUEST_TIMEOUT_SECONDS=25
 ```
 
 ## GitHub Actions

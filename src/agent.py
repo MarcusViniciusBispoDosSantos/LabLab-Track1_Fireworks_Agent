@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .classifier import TaskType, classify_task
-from .models import is_thinking_model, parse_allowed_models, ranked_models
+from .models import is_thinking_model, parse_allowed_models, ranked_models, usable_models
 from .prompts import system_for
 from .solvers import try_solve_locally
 
@@ -20,10 +20,12 @@ class AgentConfig:
     api_key: str
     base_url: str
     allowed_models: list[str]
-    request_timeout_seconds: float = 26.0
-    max_retries: int = 5
-    local_fast_paths: bool = True
-    retry_invalid_outputs: bool = True
+    request_timeout_seconds: float = 25.0
+    max_retries: int = 6
+    local_fast_paths: bool = False
+    self_check_mode: str = "all"
+    calibration_enabled: bool = True
+    calibration_model_limit: int = 4
 
     @classmethod
     def from_env(cls) -> "AgentConfig":
@@ -35,72 +37,30 @@ class AgentConfig:
             api_key=os.environ["FIREWORKS_API_KEY"],
             base_url=os.environ["FIREWORKS_BASE_URL"].rstrip("/"),
             allowed_models=parse_allowed_models(os.environ["ALLOWED_MODELS"]),
-            request_timeout_seconds=float(os.getenv("REQUEST_TIMEOUT_SECONDS", "26")),
-            max_retries=max(1, int(os.getenv("MAX_RETRIES", "5"))),
-            local_fast_paths=os.getenv("ENABLE_LOCAL_FAST_PATHS", "1").strip().lower() in {"1", "true", "yes", "on"},
-            retry_invalid_outputs=os.getenv("RETRY_INVALID_OUTPUTS", "1").strip().lower() in {"1", "true", "yes", "on"},
+            request_timeout_seconds=float(os.getenv("REQUEST_TIMEOUT_SECONDS", "25")),
+            max_retries=max(1, int(os.getenv("MAX_RETRIES", "6"))),
+            local_fast_paths=os.getenv("ENABLE_LOCAL_FAST_PATHS", "0").strip().lower() in {"1", "true", "yes", "on"},
+            self_check_mode=os.getenv("SELF_CHECK_MODE", "all").strip().lower(),
+            calibration_enabled=os.getenv("ENABLE_CATEGORY_CALIBRATION", "1").strip().lower() in {"1", "true", "yes", "on"},
+            calibration_model_limit=max(1, int(os.getenv("CALIBRATION_MODEL_LIMIT", "4"))),
         )
 
 
 class FireworksTrack1Agent:
-    """Accuracy-first but runtime-safe Track 1 agent.
+    """Maximum-correctness Track 1 agent.
 
-    v9 target-85 strategy:
-    - Use deterministic local solvers only for very high-confidence exact cases.
-    - Otherwise send the original hidden prompt directly to the strongest allowed model.
-    - Do not run a verifier on every task; prior versions often corrupted good answers
-      or exceeded runtime. Retry only when output is clearly invalid for the prompt.
+    v10 changes the strategy from name-based model guesses to category-specific
+    model calibration. The hidden benchmark may expose multiple Fireworks models;
+    different models often excel at different capabilities. v10 runs a compact
+    public calibration set, chooses a model per category, then solves each hidden
+    task with the original prompt and a self-check pass.
     """
 
     def __init__(self, config: AgentConfig):
         self.config = config
-        self._calibrated_model: str | None = None
-        self._calibrated_code_model: str | None = None
-        if os.getenv("ENABLE_MODEL_CALIBRATION", "1").strip().lower() in {"1", "true", "yes", "on"}:
-            self._run_model_calibration()
-
-
-    def _preferred_model(self, task_type: TaskType) -> str | None:
-        if task_type in {TaskType.CODE_GEN, TaskType.CODE_DEBUG} and self._calibrated_code_model:
-            return self._calibrated_code_model
-        return self._calibrated_model
-
-    def _run_model_calibration(self) -> None:
-        """Choose the most accurate model from ALLOWED_MODELS using tiny known tasks.
-
-        This does not cache hidden evaluation answers. It only detects which allowed
-        model follows instructions best in the current harness. Previous versions
-        likely lost accuracy by choosing a weaker model from ALLOWED_MODELS.
-        """
-        models = ranked_models(self.config.allowed_models, TaskType.FACTUAL)
-        if len(models) <= 1:
-            return
-        limit = max(1, min(int(os.getenv("CALIBRATION_MODEL_LIMIT", "4")), len(models)))
-        candidates = models[:limit]
-        best_model = candidates[0]
-        best_score = -1
-        best_code_model = candidates[0]
-        best_code_score = -1
-        for model in candidates:
-            try:
-                text = self._chat_completion(model, [
-                    {"role": "system", "content": "You are a precise evaluator. Return concise answers only."},
-                    {"role": "user", "content": _CALIBRATION_PROMPT},
-                ], 500)
-                score, code_score = _score_calibration(text)
-            except Exception:
-                score, code_score = -1, -1
-            if score > best_score:
-                best_score = score
-                best_model = model
-            if code_score > best_code_score:
-                best_code_score = code_score
-                best_code_model = model
-        # Only override if the model demonstrates at least basic correctness.
-        if best_score >= 2:
-            self._calibrated_model = best_model
-        if best_code_score >= 1:
-            self._calibrated_code_model = best_code_model
+        self._category_models: dict[TaskType, list[str]] = {}
+        if self.config.calibration_enabled:
+            self._calibrate_category_models()
 
     def answer_task(self, task: dict[str, Any]) -> dict[str, str]:
         task_id = str(task.get("task_id", "")) or "missing_task_id"
@@ -110,8 +70,6 @@ class FireworksTrack1Agent:
 
         task_type = classify_task(prompt)
 
-        # High-confidence deterministic solvers. These avoid weak-model mistakes on
-        # common exact tasks, but only if the local answer is provably format-safe.
         if self.config.local_fast_paths:
             try:
                 local = try_solve_locally(prompt, task_type)
@@ -120,53 +78,140 @@ class FireworksTrack1Agent:
             except Exception:
                 pass
 
-        answer = self._solve_direct_with_fallback(prompt, task_type)
+        answer = self._solve_with_best_category_model(prompt, task_type)
         answer = _final_cleanup(answer, task_type, prompt)
 
-        # Targeted repair only when the final format is obviously wrong. This gives
-        # accuracy benefits without doubling calls on every hidden task.
-        if self.config.retry_invalid_outputs and _needs_repair(answer, task_type, prompt):
+        if self._should_self_check(prompt, task_type, answer):
+            checked = self._self_check(prompt, task_type, answer)
+            if checked and not _looks_unusable(checked):
+                cleaned = _final_cleanup(checked, task_type, prompt)
+                if cleaned:
+                    answer = cleaned
+
+        # Last repair if the answer still obviously violates format.
+        if _needs_repair(answer, task_type, prompt):
             repaired = self._repair(prompt, task_type, answer)
             if repaired and not _looks_unusable(repaired):
                 answer = _final_cleanup(repaired, task_type, prompt)
 
-        return {"task_id": task_id, "answer": answer}
+        return {"task_id": task_id, "answer": answer.strip()}
 
-    def _solve_direct_with_fallback(self, prompt: str, task_type: TaskType) -> str:
-        models = ranked_models(self.config.allowed_models, task_type)
-        preferred = self._preferred_model(task_type)
-        if preferred and preferred in models:
-            models = [preferred] + [m for m in models if m != preferred]
-        if not models:
-            return "Unable to produce a reliable answer."
+    # ------------------------- model calibration -------------------------
+
+    def _calibrate_category_models(self) -> None:
+        candidates = usable_models(self.config.allowed_models)
+        if not candidates:
+            return
+        # Combine harness order with name heuristic. Limit calls to stay within runtime.
+        prelim = ranked_models(candidates, TaskType.FACTUAL)
+        ordered: list[str] = []
+        for m in prelim + candidates:
+            if m not in ordered:
+                ordered.append(m)
+        candidates = ordered[: min(len(ordered), self.config.calibration_model_limit)]
+        if len(candidates) <= 1:
+            return
+
+        scores_by_cat: dict[TaskType, list[tuple[int, str]]] = {cat: [] for cat in TaskType}
+        for model in candidates:
+            try:
+                text = self._chat_completion(
+                    model,
+                    [
+                        {"role": "system", "content": "You are a precise benchmark solver. Return compact answers only."},
+                        {"role": "user", "content": _CALIBRATION_PROMPT},
+                    ],
+                    1200,
+                )
+                scores = _score_category_calibration(text)
+            except Exception:
+                scores = {cat: -1 for cat in TaskType}
+            for cat in TaskType:
+                scores_by_cat[cat].append((scores.get(cat, -1), model))
+
+        for cat, scored in scores_by_cat.items():
+            scored.sort(key=lambda x: x[0], reverse=True)
+            # Keep category-calibrated order but append heuristic fallbacks.
+            selected = [m for score, m in scored if score >= 0]
+            for m in ranked_models(self.config.allowed_models, cat):
+                if m not in selected:
+                    selected.append(m)
+            self._category_models[cat] = selected
+
+    def _models_for(self, task_type: TaskType) -> list[str]:
+        models = self._category_models.get(task_type) or ranked_models(self.config.allowed_models, task_type)
+        forced = os.getenv("FORCE_MODEL", "").strip()
+        if forced and forced in models:
+            return [forced] + [m for m in models if m != forced]
+        return models
+
+    # ------------------------- solving -------------------------
+
+    def _solve_with_best_category_model(self, prompt: str, task_type: TaskType) -> str:
+        models = self._models_for(task_type)
         last = ""
-        tried = 0
-        for model in models:
-            if tried >= self.config.max_retries:
-                break
-            tried += 1
+        for idx, model in enumerate(models[: self.config.max_retries]):
             try:
                 ans = self._direct(prompt, task_type, model)
                 if ans and not _looks_unusable(ans):
-                    return ans
-                last = ans or last
+                    # Accept immediately if format is plausible. Otherwise try the next model.
+                    if not _needs_repair(_final_cleanup(ans, task_type, prompt), task_type, prompt):
+                        return ans
+                    last = ans
+                else:
+                    last = ans or last
             except Exception:
-                time.sleep(0.4 * tried)
+                time.sleep(0.25 * (idx + 1))
         return last.strip() or "Unable to produce a reliable answer."
 
     def _direct(self, prompt: str, task_type: TaskType, model: str) -> str:
-        messages = [
-            {"role": "system", "content": system_for(task_type)},
-            {"role": "user", "content": prompt},
-        ]
-        return self._chat_completion(model, messages, _max_tokens(task_type))
+        return self._chat_completion(
+            model,
+            [
+                {"role": "system", "content": system_for(task_type)},
+                {"role": "user", "content": prompt},
+            ],
+            _max_tokens(task_type),
+        )
+
+    def _should_self_check(self, prompt: str, task_type: TaskType, answer: str) -> bool:
+        mode = self.config.self_check_mode
+        if mode in {"0", "false", "off", "none"}:
+            return False
+        if mode == "hard":
+            return task_type in {TaskType.MATH, TaskType.LOGIC, TaskType.CODE_DEBUG, TaskType.CODE_GEN, TaskType.NER}
+        # For summaries and short factual tasks, self-check can over-edit strict length.
+        if task_type == TaskType.SUMMARY and any(k in prompt.lower() for k in ["one sentence", "exactly", "words"]):
+            return False
+        return True
+
+    def _self_check(self, prompt: str, task_type: TaskType, draft: str) -> str:
+        models = self._models_for(task_type)
+        if not models:
+            return draft
+        # Prefer second category model for independent check when available; otherwise same model.
+        model = models[1] if len(models) > 1 else models[0]
+        check_prompt = (
+            "Verify the draft answer against the original task.\n"
+            "If the draft is fully correct and matches the requested format, return it unchanged.\n"
+            "If it is wrong, incomplete, too verbose, or format-invalid, return the corrected final answer only.\n\n"
+            f"Original task:\n{prompt}\n\nDraft answer:\n{draft}"
+        )
+        return self._chat_completion(
+            model,
+            [
+                {"role": "system", "content": system_for(task_type)},
+                {"role": "user", "content": check_prompt},
+            ],
+            _repair_tokens(task_type),
+        )
 
     def _repair(self, prompt: str, task_type: TaskType, bad_answer: str) -> str:
-        models = ranked_models(self.config.allowed_models, task_type)
+        models = self._models_for(task_type)
         if not models:
             return bad_answer
         repair_prompt = (
-            "The previous answer did not satisfy the requested format or was incomplete.\n"
+            "The previous answer does not satisfy the task or requested format.\n"
             "Return the corrected final answer only.\n\n"
             f"Original task:\n{prompt}\n\nPrevious answer:\n{bad_answer}"
         )
@@ -233,42 +278,60 @@ class FireworksTrack1Agent:
                     elif isinstance(item, str):
                         parts.append(item)
                 if parts:
-                    return _remove_thinking("\n".join(parts)).strip()
-        text = choice.get("text")
-        if isinstance(text, str):
-            return _remove_thinking(text).strip()
-        raise RuntimeError(f"Could not parse assistant content: {raw[:700]}")
+                    return _remove_thinking("".join(parts)).strip()
+        if isinstance(choice.get("text"), str):
+            return _remove_thinking(choice["text"]).strip()
+        raise RuntimeError(f"Cannot extract message content: {raw[:700]}")
 
 
+# ------------------------- calibration -------------------------
 
-_CALIBRATION_PROMPT = """Solve these calibration tasks. Return plain text with four labeled lines: MATH, SENTIMENT, DEBUG, LOGIC.
-MATH: A store has 100 users. It grows by 20% and then loses 10%. What is the final number?
-SENTIMENT: Classify as Positive, Negative, Neutral, or Mixed: The interface is fast and clean, but it crashes often.
-DEBUG: In Python, what is the bug and fix? def average(nums): return sum(nums) / len(num)
-LOGIC: Alice, Bob, and Cara each own one pet: cat, dog, or bird. Alice does not own the dog. Bob does not own the cat. Cara owns the bird. Who owns each pet?
+_CALIBRATION_PROMPT = """Answer the following calibration tasks. Use the exact labels C1-C8.
+C1 Math: A $120 item is discounted 25% and then 8% tax is added. Final price?
+C2 Sentiment: Label as Positive, Negative, Neutral, or Mixed: The interface is clean and fast, but export fails every time.
+C3 Summary: Summarize in one sentence: Cloud computing lets companies rent computing resources over the internet instead of buying physical servers. It improves scalability and reduces upfront cost.
+C4 NER: Extract entities and labels: On July 4, 2026, Ana Silva joined AMD in Austin, Texas.
+C5 Debug: Fix this Python bug: def avg(nums): return sum(nums) / len(num)
+C6 Logic: Alice, Bob, and Cara each own one pet: cat, dog, or bird. Alice does not own the dog. Bob does not own the cat. Cara owns the bird. Who owns each pet?
+C7 Code: Write Python function is_even(n) returning True if n is even.
+C8 Factual: In one sentence, what is HTTP?
 """
 
 
-def _score_calibration(text: str) -> tuple[int, int]:
+def _score_category_calibration(text: str) -> dict[TaskType, int]:
     low = text.lower()
-    score = 0
-    code_score = 0
-    if re.search(r"\b108(?:\.0+)?\b", low):
-        score += 1
+    scores = {cat: 0 for cat in TaskType}
+    if re.search(r"\b97\.?(?:20)?\b", low) or "$97.20" in text:
+        scores[TaskType.MATH] += 3
     if "mixed" in low:
-        score += 1
-    if "len(nums)" in text or ("num" in low and "undefined" in low):
-        score += 1
-        code_score += 1
+        scores[TaskType.SENTIMENT] += 3
+    if "rent" in low and ("computing" in low or "resources" in low) and ("scal" in low or "cost" in low):
+        scores[TaskType.SUMMARY] += 3
+    if all(x in low for x in ["ana", "amd", "austin"]) and ("date" in low or "july 4" in low):
+        scores[TaskType.NER] += 3
+    if "len(nums)" in text or ("len(num)" in text and "bug" in low and "nums" in low):
+        scores[TaskType.CODE_DEBUG] += 3
     if all(x in low for x in ["alice", "cat", "bob", "dog", "cara", "bird"]):
-        score += 1
-    return score, code_score
+        scores[TaskType.LOGIC] += 3
+    if "def is_even" in text and ("% 2" in text or "& 1" in text or "mod" in low):
+        scores[TaskType.CODE_GEN] += 3
+    if "http" in low and ("protocol" in low or "web" in low or "browser" in low or "server" in low):
+        scores[TaskType.FACTUAL] += 3
+    # General formatting bonus: answer all labels rather than rambling.
+    for i in range(1, 9):
+        if f"c{i}" in low:
+            for cat in TaskType:
+                scores[cat] += 1
+            break
+    return scores
+
+
+# ------------------------- utilities -------------------------
 
 def _prepare_messages(model: str, messages: list[dict[str, str]]) -> list[dict[str, str]]:
     out = [dict(m) for m in messages]
     if is_thinking_model(model) and out and out[-1].get("role") == "user":
-        # Do not use nonstandard /no_think tokens; some model families are harmed by it.
-        out[-1]["content"] = str(out[-1].get("content", "")) + "\n\nThink privately. Return only the final answer requested."
+        out[-1]["content"] = str(out[-1].get("content", "")) + "\n\nThink privately. Do not include hidden reasoning. Return only the final answer."
     return out
 
 
@@ -278,12 +341,24 @@ def _chat_completions_url(base_url: str) -> str:
 
 
 def _max_tokens(task_type: TaskType) -> int:
-    # Keep enough room for code, but avoid long rambling that hurts runtime and judge matching.
     return {
         TaskType.FACTUAL: 700,
-        TaskType.MATH: 1100,
+        TaskType.MATH: 1200,
+        TaskType.SENTIMENT: 260,
+        TaskType.SUMMARY: 700,
+        TaskType.NER: 800,
+        TaskType.CODE_DEBUG: 2600,
+        TaskType.LOGIC: 1800,
+        TaskType.CODE_GEN: 3000,
+    }[task_type]
+
+
+def _repair_tokens(task_type: TaskType) -> int:
+    return {
+        TaskType.FACTUAL: 600,
+        TaskType.MATH: 1000,
         TaskType.SENTIMENT: 220,
-        TaskType.SUMMARY: 650,
+        TaskType.SUMMARY: 600,
         TaskType.NER: 700,
         TaskType.CODE_DEBUG: 2200,
         TaskType.LOGIC: 1500,
@@ -291,35 +366,14 @@ def _max_tokens(task_type: TaskType) -> int:
     }[task_type]
 
 
-def _repair_tokens(task_type: TaskType) -> int:
-    return {
-        TaskType.FACTUAL: 550,
-        TaskType.MATH: 900,
-        TaskType.SENTIMENT: 180,
-        TaskType.SUMMARY: 500,
-        TaskType.NER: 550,
-        TaskType.CODE_DEBUG: 1800,
-        TaskType.LOGIC: 1200,
-        TaskType.CODE_GEN: 2200,
-    }[task_type]
-
-
 def _safe_to_use_local(prompt: str, task_type: TaskType, answer: str) -> bool:
     low = prompt.lower()
-    # Do not use local shortcuts when the benchmark asks for explanations,
-    # strict schemas, unusual formatting, or hidden nuance.
     if any(k in low for k in ["json", "schema", "strict", "explain", "show your", "prove", "why", "table", "format"]):
         return False
     if task_type == TaskType.SENTIMENT:
         return answer.split()[0].strip("—:-").lower() in {"positive", "negative", "neutral", "mixed"} and len(answer) < 220
-    if task_type == TaskType.CODE_GEN:
-        return "def " in answer and len(answer) < 1600
-    if task_type == TaskType.CODE_DEBUG:
-        return "def " in answer and len(answer) < 1800
     if task_type == TaskType.MATH:
         return bool(re.fullmatch(r"[-+]?\$?\d[\d,]*(?:\.\d+)?%?(?:\s*[A-Za-z]+)?", answer.strip()))
-    if task_type == TaskType.LOGIC:
-        return len(answer) < 350 and ("=" in answer or ":" in answer)
     return False
 
 
@@ -334,16 +388,19 @@ def _needs_repair(answer: str, task_type: TaskType, prompt: str) -> bool:
         labels = _requested_labels(prompt) or ["positive", "negative", "neutral", "mixed"]
         if not any(re.search(rf"\b{re.escape(l)}\b", text, flags=re.I) for l in labels):
             return True
+    if task_type == TaskType.MATH:
+        if not re.search(r"[-+]?\d", text):
+            return True
     if task_type == TaskType.CODE_GEN:
         name = _requested_func_or_class(prompt)
         if name and name not in text:
             return True
-        if any(k in lowp for k in ["python", "function", "method"]) and not re.search(r"\bdef\s+\w+\s*\(", text):
+        if any(k in lowp for k in ["python function", "write a function", "implement a function"]) and not re.search(r"\bdef\s+\w+\s*\(", text):
             return True
     if task_type == TaskType.CODE_DEBUG:
         if "def " in prompt and "def " not in text and "bug" not in text.lower() and "fix" not in text.lower():
             return True
-    if task_type == TaskType.NER and len(text) < 3:
+    if task_type == TaskType.NER and len(text) < 6:
         return True
     return False
 
@@ -373,8 +430,6 @@ def _final_cleanup(answer: str, task_type: TaskType, prompt: str) -> str:
         text = _cleanup_sentiment(text, prompt)
 
     lower = prompt.lower()
-    if _asks_answer_only(lower):
-        text = _compact_answer_only(text, prompt)
     if re.search(r"\b(?:choose|select|option)\s+(?:a|b|c|d|e)\b", lower) or "multiple choice" in lower:
         opt = _extract_option(text)
         if opt:
@@ -383,6 +438,8 @@ def _final_cleanup(answer: str, task_type: TaskType, prompt: str) -> str:
         yn = _extract_booleanish(text)
         if yn:
             return yn
+    if _asks_answer_only(lower):
+        text = _compact_answer_only(text, prompt)
     return text.strip()
 
 
@@ -393,8 +450,6 @@ def _remove_thinking(text: str) -> str:
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.I | re.S).strip()
     if "</think>" in text.lower():
         text = re.split(r"</think>", text, flags=re.I)[-1].strip()
-    # Only strip explicit final-answer markers at the beginning of a line. Older
-    # versions used a broader regex that could accidentally delete useful content.
     m = re.search(r"(?:^|\n)\s*(?:final answer|answer|result)\s*:\s*(.+)$", text, flags=re.I | re.S)
     if m:
         cand = m.group(1).strip()
@@ -405,12 +460,11 @@ def _remove_thinking(text: str) -> str:
 
 def _strip_chat_prefix(text: str) -> str:
     out = text.strip()
-    patterns = [
+    for p in [
         r"^sure[,!]?\s*", r"^of course[,!]?\s*",
         r"^here(?:'s| is)\s+(?:the\s+)?(?:final\s+)?(?:answer|code|solution)[:\s]*",
         r"^the\s+(?:final\s+)?answer\s+is[:\s]*",
-    ]
-    for p in patterns:
+    ]:
         out = re.sub(p, "", out, flags=re.I).strip()
     return out
 
@@ -462,7 +516,6 @@ def _cleanup_sentiment(text: str, prompt: str) -> str:
                     break
     if chosen:
         canonical = next((l for l in labels if l.lower() == chosen.lower()), chosen)
-        # Preserve requested casing for binary labels when provided; otherwise title case.
         canonical_out = canonical if canonical != canonical.lower() else canonical.capitalize()
         if any(k in prompt.lower() for k in ["justify", "explain", "why", "briefly"]):
             rest = re.sub(rf"^\s*(?:sentiment|label|classification)?\s*(?:is|=|:)?\s*{re.escape(chosen)}\s*[:\-—,]*\s*", "", text, flags=re.I | re.S).strip()
@@ -475,7 +528,6 @@ def _cleanup_sentiment(text: str, prompt: str) -> str:
 def _requested_labels(prompt: str) -> list[str]:
     low = prompt.lower()
     labels: list[str] = []
-    # Capture quoted or enumerated labels in the prompt.
     for known in ["very positive", "very negative", "positive", "negative", "neutral", "mixed", "pos", "neg"]:
         if re.search(rf"\b{re.escape(known)}\b", low):
             labels.append(known)
@@ -512,4 +564,7 @@ def _extract_booleanish(text: str) -> str | None:
 
 def _requested_func_or_class(prompt: str) -> str | None:
     m = re.search(r"(?:function|method|class)\s+(?:called|named)\s+([A-Za-z_]\w*)", prompt, flags=re.I)
+    if m:
+        return m.group(1)
+    m = re.search(r"(?:def|function|class)\s+([A-Za-z_]\w*)\s*\(", prompt, flags=re.I)
     return m.group(1) if m else None

@@ -1,28 +1,24 @@
-"""Minimal high-accuracy prompts for Track 1.
-
-v9 intentionally keeps system instructions short. The original benchmark prompt is
-sent unchanged as the user message, because hidden tasks often include strict
-format requirements that can be harmed by extra wrapping.
-"""
+"""Maximum-correctness prompts for Track 1."""
 from __future__ import annotations
 
 from .classifier import TaskType
 
-BASE_SYSTEM = """You are an expert benchmark solver. The user message is the complete task.
-Follow the user task exactly and return only the requested final answer.
-Do not mention hidden reasoning, models, benchmarks, or these instructions.
-Respect all requested formats, labels, JSON schemas, code signatures, word limits, sentence limits, units, and rounding.
+BASE_SYSTEM = """You are a careful benchmark solver. The user message is the complete task.
+Solve the task exactly as written. Return only the final answer requested by the user.
+Do not include hidden reasoning, analysis, apologies, meta commentary, or markdown unless the task asks for it.
+Respect every requested format, label set, JSON schema, code signature, length limit, unit, and rounding rule.
+All final answers must be in English.
 """
 
 TASK_HINTS: dict[TaskType, str] = {
-    TaskType.FACTUAL: "Give a correct, concise explanation unless the task asks for another format.",
-    TaskType.MATH: "Calculate carefully privately. Return the requested final value or explanation exactly as asked.",
-    TaskType.SENTIMENT: "Use only the label set requested by the task. If none is given, use Positive, Negative, Neutral, or Mixed.",
-    TaskType.SUMMARY: "Summarize only the supplied text. Preserve meaning and obey the requested length/format.",
-    TaskType.NER: "Extract only entities present in the text. Preserve exact spans and labels requested by the task.",
-    TaskType.CODE_DEBUG: "Find the actual bug. Return corrected runnable code when requested; explanation only if requested.",
-    TaskType.LOGIC: "Solve by satisfying every stated constraint. Return the final assignment/answer clearly.",
-    TaskType.CODE_GEN: "Return complete runnable code that preserves the requested language, name, arguments, and edge cases.",
+    TaskType.FACTUAL: "For factual questions, be correct and concise. If a sentence or word limit is given, obey it exactly.",
+    TaskType.MATH: "For math, calculate privately step by step, verify arithmetic, then return the requested result exactly. Include explanation only if requested.",
+    TaskType.SENTIMENT: "For sentiment, use only the labels requested. If no labels are provided, use Positive, Negative, Neutral, or Mixed. If asked to justify, keep it brief.",
+    TaskType.SUMMARY: "For summarization, summarize only the supplied text. Do not add outside facts. Obey sentence, bullet, and word limits.",
+    TaskType.NER: "For entity extraction, extract only entities present in the text. Preserve exact names, dates, organizations, and locations. Use the requested labels/format.",
+    TaskType.CODE_DEBUG: "For code debugging, identify the real bug and provide corrected runnable code when requested. Preserve the original language and function signature.",
+    TaskType.LOGIC: "For logic puzzles, satisfy every constraint. Check the final assignment against all conditions before answering.",
+    TaskType.CODE_GEN: "For code generation, return complete runnable code. Preserve the requested language, function/class name, parameters, return behavior, and edge cases.",
 }
 
 
