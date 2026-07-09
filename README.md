@@ -1,19 +1,16 @@
 # FireRoute AI
 
-## Accuracy v5 update
+**Accuracy v6** is the most accuracy-focused version of the Track 1 agent.
 
-This version is accuracy-first because the official feedback said the previous container ran but did not pass the minimum accuracy threshold. v5 changes the defaults to:
+It was updated after the official feedback reported an accuracy of about **52.6%**. The main changes are:
 
-- `VERIFY_MODE=all` for a second correction pass on every task.
-- `ENABLE_LOCAL_FAST_PATHS=0` so hidden benchmark prompts are solved by the strongest allowed Fireworks model rather than regex shortcuts.
-- `MAX_WORKERS=2` to reduce proxy/rate-limit failures during evaluation.
-- Higher output token limits for math, logic, debugging, and code generation.
-- Stronger model ranking from `ALLOWED_MODELS`, including reasoning-capable models when they are provided by the harness.
-
-The final container still reads `FIREWORKS_API_KEY`, `FIREWORKS_BASE_URL`, and `ALLOWED_MODELS` from the environment, reads `/input/tasks.json`, and writes `/output/results.json`.
-
-
-FireRoute AI is an accuracy-first, Dockerized Track 1 agent for the AMD Developer Hackathon ACT II. It reads tasks from `/input/tasks.json`, solves them through Fireworks AI using the judging harness environment, and writes valid answers to `/output/results.json`.
+- Hidden prompts are solved by the strongest allowed Fireworks model, not brittle regex shortcuts.
+- `ENABLE_LOCAL_FAST_PATHS=0` is now the real Docker default.
+- `MAX_WORKERS=1` reduces proxy/rate-limit failures during the hidden benchmark.
+- `VERIFY_MODE=hard` verifies math, logic, code debugging, and code generation without wasting extra calls on easier categories.
+- Explicit reasoning models are used only after stable instruction models, reducing final-answer truncation.
+- `/no_think` and final-only instructions are added for reasoning-style models.
+- Code, math, NER, sentiment, summary, and logic prompts were simplified and made stricter.
 
 ## Track 1 Contract
 
@@ -26,25 +23,11 @@ The container:
 - reads `ALLOWED_MODELS` from the environment
 - routes all Fireworks calls through `FIREWORKS_BASE_URL`
 - does not hardcode API keys or final model IDs
-- is built as `linux/amd64`
-
-## Accuracy v4 Updates
-
-This version is optimized after the official feedback: **the agent ran but did not pass the minimum accuracy threshold**.
-
-v4 changes:
-
-- avoids reasoning models by default because they can consume the output budget in hidden reasoning
-- uses stronger non-reasoning model ranking from `ALLOWED_MODELS`
-- adds a universal Track 1 prompt so a routing mistake is less damaging
-- verifies only hard tasks by default: math, logic, code debugging, and code generation
-- adds deterministic fast paths for common math, sentiment, code generation, debugging, NER, and simple assignment-logic patterns
-- keeps output compact and removes `<think>...</think>` content from final answers
-- includes GitHub Actions checks and GHCR publish workflow
+- is built for `linux/amd64`
 
 ## Required Capability Areas
 
-FireRoute AI supports all Track 1 capability categories:
+FireRoute AI supports all Track 1 categories:
 
 1. factual knowledge
 2. mathematical reasoning
@@ -87,16 +70,24 @@ FIREWORKS_BASE_URL
 ALLOWED_MODELS
 ```
 
-Optional tuning variables:
+Accuracy v6 defaults:
 
 ```bash
-VERIFY_MODE=hard                 # none | hard | all
-ENABLE_LOCAL_FAST_PATHS=1        # deterministic solvers for obvious cases
-ALLOW_THINKING_MODELS=0          # keep R1/reasoning models as fallback only
-MAX_WORKERS=3
-MAX_RETRIES=2
-REQUEST_TIMEOUT_SECONDS=26
+VERIFY_MODE=hard
+ENABLE_LOCAL_FAST_PATHS=0
+MAX_WORKERS=1
+MAX_RETRIES=4
+REQUEST_TIMEOUT_SECONDS=29
 ```
+
+For emergency maximum accuracy on small batches, you may set:
+
+```bash
+VERIFY_MODE=all
+USE_ENSEMBLE_FOR_CODE=1
+```
+
+But the default v6 settings are safer for the official 10-minute hidden evaluation.
 
 ## Online Contract Test
 
@@ -106,9 +97,9 @@ Use GitHub Actions:
 Actions → Track 1 Online Check → Run workflow
 ```
 
-This builds the image, runs a mock Fireworks-compatible harness, validates `/output/results.json`, and confirms the image works with env variables.
+This builds the image, runs a mock Fireworks-compatible harness, validates `/output/results.json`, and confirms the image works with the required environment variables.
 
-## Build and Publish linux/amd64 Image
+## Publish linux/amd64 Image
 
 The judging VM runs `linux/amd64`; the final image must include a `linux/amd64` manifest.
 
