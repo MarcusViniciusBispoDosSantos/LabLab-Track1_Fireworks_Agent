@@ -1,68 +1,34 @@
-# FireRoute AI
+# FireRoute AI — Track 1 Accuracy v7
 
-**Accuracy v6** is the most accuracy-focused version of the Track 1 agent.
+FireRoute AI is a Dockerized Track 1 agent for the AMD Developer Hackathon ACT II. It reads tasks from `/input/tasks.json`, solves each natural-language prompt using the Fireworks AI runtime injected by the judging harness, and writes valid results to `/output/results.json`.
 
-It was updated after the official feedback reported an accuracy of about **52.6%**. The main changes are:
+## Track 1 contract
 
-- Hidden prompts are solved by the strongest allowed Fireworks model, not brittle regex shortcuts.
-- `ENABLE_LOCAL_FAST_PATHS=0` is now the real Docker default.
-- `MAX_WORKERS=1` reduces proxy/rate-limit failures during the hidden benchmark.
-- `VERIFY_MODE=hard` verifies math, logic, code debugging, and code generation without wasting extra calls on easier categories.
-- Explicit reasoning models are used only after stable instruction models, reducing final-answer truncation.
-- `/no_think` and final-only instructions are added for reasoning-style models.
-- Code, math, NER, sentiment, summary, and logic prompts were simplified and made stricter.
+The submitted container:
 
-## Track 1 Contract
+- Reads `/input/tasks.json` on startup.
+- Writes `/output/results.json` before exiting.
+- Reads `FIREWORKS_API_KEY`, `FIREWORKS_BASE_URL`, and `ALLOWED_MODELS` from environment variables.
+- Routes all Fireworks calls through `FIREWORKS_BASE_URL`.
+- Does not hardcode API keys or model IDs.
+- Builds as `linux/amd64`.
 
-The container:
+## Accuracy v7 changes
 
-- reads `/input/tasks.json` on startup
-- writes `/output/results.json` before exiting
-- reads `FIREWORKS_API_KEY` from the environment
-- reads `FIREWORKS_BASE_URL` from the environment
-- reads `ALLOWED_MODELS` from the environment
-- routes all Fireworks calls through `FIREWORKS_BASE_URL`
-- does not hardcode API keys or final model IDs
-- is built for `linux/amd64`
+This version is designed to improve hidden benchmark accuracy after previous runs scored below the required threshold.
 
-## Required Capability Areas
+Key changes:
 
-FireRoute AI supports all Track 1 categories:
+- Sends the original prompt directly to the model instead of wrapping it with internal classifier text.
+- Uses conservative local solvers only for high-confidence easy cases.
+- Uses an ensemble strategy for hard categories: math, logic, code debugging, and code generation.
+- Selects diverse strong models from `ALLOWED_MODELS` when available.
+- Uses a final-answer selector to choose or synthesize the best answer from multiple candidates.
+- Preserves strict output formatting and removes common reasoning / chatty prefixes.
 
-1. factual knowledge
-2. mathematical reasoning
-3. sentiment classification
-4. text summarization
-5. named entity recognition
-6. code debugging
-7. logical / deductive reasoning
-8. code generation
+## Environment variables
 
-## Input Format
-
-`/input/tasks.json`
-
-```json
-[
-  { "task_id": "t1", "prompt": "Summarise the following text in one sentence: ..." },
-  { "task_id": "t2", "prompt": "Write a Python function called is_palindrome(text)." }
-]
-```
-
-## Output Format
-
-`/output/results.json`
-
-```json
-[
-  { "task_id": "t1", "answer": "..." },
-  { "task_id": "t2", "answer": "..." }
-]
-```
-
-## Environment Variables
-
-The official judging harness injects:
+For final judging, these are injected by the harness:
 
 ```bash
 FIREWORKS_API_KEY
@@ -70,52 +36,21 @@ FIREWORKS_BASE_URL
 ALLOWED_MODELS
 ```
 
-Accuracy v6 defaults:
+Optional tuning variables:
 
 ```bash
-VERIFY_MODE=hard
-ENABLE_LOCAL_FAST_PATHS=0
-MAX_WORKERS=1
-MAX_RETRIES=4
-REQUEST_TIMEOUT_SECONDS=29
+ACCURACY_STRATEGY=ensemble_hard   # direct | verify_hard | ensemble_hard | ensemble_all
+ENABLE_LOCAL_FAST_PATHS=1
+MAX_WORKERS=2
+REQUEST_TIMEOUT_SECONDS=28
+MAX_RETRIES=3
 ```
 
-For emergency maximum accuracy on small batches, you may set:
+Recommended final defaults are already set in the Dockerfile.
 
-```bash
-VERIFY_MODE=all
-USE_ENSEMBLE_FOR_CODE=1
-```
+## Build and push
 
-But the default v6 settings are safer for the official 10-minute hidden evaluation.
-
-## Online Contract Test
-
-Use GitHub Actions:
-
-```text
-Actions → Track 1 Online Check → Run workflow
-```
-
-This builds the image, runs a mock Fireworks-compatible harness, validates `/output/results.json`, and confirms the image works with the required environment variables.
-
-## Publish linux/amd64 Image
-
-The judging VM runs `linux/amd64`; the final image must include a `linux/amd64` manifest.
-
-Use the included workflow:
-
-```text
-Actions → Publish Docker Image to GHCR → Run workflow
-```
-
-Expected public image:
-
-```bash
-ghcr.io/marcusviniciusbispodossantos/fireroute-ai:latest
-```
-
-Manual equivalent:
+For manual Docker builds:
 
 ```bash
 docker buildx build \
@@ -125,22 +60,15 @@ docker buildx build \
   .
 ```
 
-## lablab.ai Submission URLs
+If you do not have Docker locally, use the included GitHub Actions workflow:
 
-Public GitHub Repository:
+1. Push this repository to GitHub.
+2. Run **Track 1 Online Check**.
+3. Run **Publish Docker Image to GHCR**.
+4. Re-save the lablab.ai submission so the platform pulls the latest image.
 
-```text
-https://github.com/MarcusViniciusBispoDosSantos/LabLab-Track1_Fireworks_Agent
-```
+## Public image
 
-Application URL if the form requires an HTTPS URL:
-
-```text
-https://github.com/MarcusViniciusBispoDosSantos/LabLab-Track1_Fireworks_Agent
-```
-
-Docker image reference:
-
-```text
+```bash
 ghcr.io/marcusviniciusbispodossantos/fireroute-ai:latest
 ```
