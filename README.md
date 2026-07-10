@@ -1,85 +1,80 @@
-# FireRoute AI — Track 1 Accuracy v11
+# FireRoute AI — Track 1 Accuracy v12
 
-This is a reliability-first Track 1 project for the AMD Developer Hackathon ACT II.
+This is a Dockerized Track 1 agent for the AMD Developer Hackathon ACT II.
 
-## What it does
+## What changed in v12
+
+v12 is a correctness-first rebuild after the previous versions plateaued around 63%.
+
+Key changes:
+
+- Validated batch solving for the full `/input/tasks.json` array.
+- Per-task fallback for any missing or invalid batch answer.
+- Stronger model ranking from `ALLOWED_MODELS`.
+- Robust retry handling for 429/5xx/timeout proxy errors.
+- Original prompts are preserved; the agent does not hardcode hidden answers.
+- Conservative deterministic solvers only for safe math, sentiment, simple logic, and common code tasks.
+- `linux/amd64` GHCR publishing workflow included.
+
+## Official Track 1 contract
 
 The container:
 
-1. Reads tasks from `/input/tasks.json`
-2. Solves each task using Fireworks AI through the harness-provided environment
-3. Writes valid answers to `/output/results.json`
-4. Exits with code `0` on success
+1. Reads tasks from `/input/tasks.json`.
+2. Writes results to `/output/results.json`.
+3. Reads these environment variables from the judging harness:
+   - `FIREWORKS_API_KEY`
+   - `FIREWORKS_BASE_URL`
+   - `ALLOWED_MODELS`
+4. Sends all Fireworks calls through `FIREWORKS_BASE_URL`.
+5. Does not hardcode model IDs.
+6. Exits with code 0 on success.
 
-It supports the 8 Track 1 categories:
+## Docker image
 
-- factual knowledge
-- mathematical reasoning
-- sentiment classification
-- text summarization
-- named entity recognition
-- code debugging
-- logical / deductive reasoning
-- code generation
-
-## Important v11 strategy
-
-Previous versions plateaued around 57–63% accuracy. v11 is built to reduce the most likely causes:
-
-- no category calibration calls that can waste runtime or choose badly
-- no global self-check that can corrupt already-correct answers
-- original hidden prompt is sent to Fireworks unchanged
-- harness model order is trusted more strongly
-- ensemble is used only for hard tasks: math, logic, debugging, and code generation
-- conservative local fast paths are used only for simple high-confidence cases
-- sentiment cleanup bug fixed: answers starting with `Mixed` no longer get changed to `Positive`
-- all calls still go through `FIREWORKS_BASE_URL`
-
-I cannot guarantee a specific hidden score because lablab.ai does not show failed prompts, but this version is designed to be more reliable than the v8/v9/v10 strategies.
-
-## Required environment variables
-
-The official judge injects these values at runtime:
+Final image reference:
 
 ```bash
-FIREWORKS_API_KEY
-FIREWORKS_BASE_URL
-ALLOWED_MODELS
-```
-
-Do not commit a real `.env` file. The submitted image reads these variables from the environment.
-
-## Local / CI mock test
-
-The mock test does not test real model accuracy. It only confirms Docker contract compatibility.
-
-```bash
-bash scripts/test_with_mock.sh
-```
-
-## Build linux/amd64 image
-
-The judging VM runs `linux/amd64`, so the image must include a linux/amd64 manifest.
-
-```bash
-docker buildx build \
-  --platform linux/amd64 \
-  --tag ghcr.io/marcusviniciusbispodossantos/fireroute-ai:latest \
-  --push \
-  .
-```
-
-## GitHub Actions
-
-Use these workflows:
-
-- `Track 1 Online Check` — verifies the container contract with a mock Fireworks server
-- `Publish Docker Image to GHCR` — builds and pushes the `linux/amd64` image
-
-After publishing, re-save the lablab.ai submission so the platform pulls the latest image.
-
-## Submission image
-
-```text
 ghcr.io/marcusviniciusbispodossantos/fireroute-ai:latest
 ```
+
+The image must be public and include a `linux/amd64` manifest.
+
+## Online validation
+
+Run:
+
+```text
+GitHub → Actions → Track 1 Online Check → Run workflow
+```
+
+Then publish:
+
+```text
+GitHub → Actions → Publish Docker Image to GHCR → Run workflow
+```
+
+After publishing, re-save the lablab.ai submission so it pulls the new image.
+
+## Environment defaults
+
+Accuracy-first defaults are set in the Dockerfile:
+
+```env
+BATCH_SOLVE=1
+BATCH_CANDIDATES=1
+ENSEMBLE_MODE=hard
+ENABLE_LOCAL_FAST_PATHS=1
+MAX_WORKERS=1
+MAX_RETRIES=4
+HARD_ENSEMBLE_SIZE=2
+REQUEST_TIMEOUT_SECONDS=40
+```
+
+If v12 does not improve, try one controlled variation by editing Dockerfile:
+
+```env
+BATCH_SOLVE=0
+```
+
+Then republish and re-save. This isolates whether batch solving helps or hurts the hidden benchmark.

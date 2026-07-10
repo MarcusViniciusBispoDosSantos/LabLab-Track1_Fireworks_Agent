@@ -68,24 +68,29 @@ def main() -> int:
         max_workers = int(os.getenv("MAX_WORKERS", "2"))
         max_workers = max(1, min(max_workers, 8, len(tasks) or 1))
 
-        indexed_results: list[tuple[int, dict[str, str]]] = []
-        if max_workers == 1 or len(tasks) <= 1:
-            for idx, task in enumerate(tasks):
-                indexed_results.append((idx, agent.answer_task(task)))
+        # v12 supports a validated batch path. If disabled or failed, the agent falls back
+        # internally to per-task solving while preserving output order.
+        if hasattr(agent, "answer_tasks"):
+            results = agent.answer_tasks(tasks)
         else:
-            with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                futures = {pool.submit(agent.answer_task, task): idx for idx, task in enumerate(tasks)}
-                for future in as_completed(futures):
-                    idx = futures[future]
-                    try:
-                        indexed_results.append((idx, future.result()))
-                    except Exception as exc:
-                        # Per-task fallback keeps the whole submission from producing malformed/missing JSON.
-                        task_id = str(tasks[idx].get("task_id", f"task_{idx}"))
-                        indexed_results.append((idx, {"task_id": task_id, "answer": "Unable to produce a reliable answer."}))
+            indexed_results: list[tuple[int, dict[str, str]]] = []
+            if max_workers == 1 or len(tasks) <= 1:
+                for idx, task in enumerate(tasks):
+                    indexed_results.append((idx, agent.answer_task(task)))
+            else:
+                with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                    futures = {pool.submit(agent.answer_task, task): idx for idx, task in enumerate(tasks)}
+                    for future in as_completed(futures):
+                        idx = futures[future]
+                        try:
+                            indexed_results.append((idx, future.result()))
+                        except Exception:
+                            task_id = str(tasks[idx].get("task_id", f"task_{idx}"))
+                            indexed_results.append((idx, {"task_id": task_id, "answer": "I don't know."}))
+            indexed_results.sort(key=lambda x: x[0])
+            results = [r for _, r in indexed_results]
 
-        indexed_results.sort(key=lambda x: x[0])
-        _write_results(output_path, [r for _, r in indexed_results])
+        _write_results(output_path, results)
         return 0
     except Exception:
         # A global setup/input/output failure should be a real failure, per the guide.

@@ -15,17 +15,30 @@ from .prompts import REPAIR_SYSTEM, SELECTOR_SYSTEM, system_for
 from .solvers import try_solve_locally
 
 
+BATCH_SYSTEM = """You are an expert hidden-benchmark solver for a general-purpose AI agent.
+You will receive a JSON array of tasks. Each task has task_id and prompt.
+Return ONLY a valid JSON array. No markdown. No explanations outside JSON.
+Each output item must be exactly: {"task_id":"same id","answer":"final answer string"}.
+Solve every task independently and obey the exact format requested inside each prompt.
+Think privately. Do not include chain-of-thought. Do not skip tasks.
+For code tasks, put complete code inside the answer string. For JSON-answer tasks, put the requested JSON as a string value.
+"""
+
+
 @dataclass(frozen=True)
 class AgentConfig:
     api_key: str
     base_url: str
     allowed_models: list[str]
-    request_timeout_seconds: float = 30.0
+    request_timeout_seconds: float = 40.0
     max_retries: int = 4
     local_fast_paths: bool = True
     ensemble_mode: str = "hard"  # off | hard | all
-    hard_ensemble_size: int = 3
+    hard_ensemble_size: int = 2
     repair_enabled: bool = True
+    batch_solve: bool = True
+    batch_candidate_count: int = 1
+    batch_max_tokens: int = 9000
 
     @classmethod
     def from_env(cls) -> "AgentConfig":
@@ -37,26 +50,35 @@ class AgentConfig:
             api_key=os.environ["FIREWORKS_API_KEY"],
             base_url=os.environ["FIREWORKS_BASE_URL"].rstrip("/"),
             allowed_models=parse_allowed_models(os.environ["ALLOWED_MODELS"]),
-            request_timeout_seconds=float(os.getenv("REQUEST_TIMEOUT_SECONDS", "30")),
+            request_timeout_seconds=float(os.getenv("REQUEST_TIMEOUT_SECONDS", "40")),
             max_retries=max(1, int(os.getenv("MAX_RETRIES", "4"))),
             local_fast_paths=os.getenv("ENABLE_LOCAL_FAST_PATHS", "1").strip().lower() in {"1", "true", "yes", "on"},
             ensemble_mode=os.getenv("ENSEMBLE_MODE", "hard").strip().lower(),
-            hard_ensemble_size=max(1, int(os.getenv("HARD_ENSEMBLE_SIZE", "3"))),
+            hard_ensemble_size=max(1, int(os.getenv("HARD_ENSEMBLE_SIZE", "2"))),
             repair_enabled=os.getenv("REPAIR_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"},
+            batch_solve=os.getenv("BATCH_SOLVE", "1").strip().lower() in {"1", "true", "yes", "on"},
+            batch_candidate_count=max(1, int(os.getenv("BATCH_CANDIDATES", "1"))),
+            batch_max_tokens=max(1000, int(os.getenv("BATCH_MAX_TOKENS", "9000"))),
         )
 
 
 class FireworksTrack1Agent:
-    """v11 reliability-first agent.
+    """v12 correctness-first agent.
 
-    The previous versions showed the container works but plateaued around 63%.
-    v11 removes risky global self-check/calibration, preserves the benchmark prompt
-    unchanged, trusts harness model order, and uses ensemble only when it is likely
-    to improve hard tasks. This reduces answer corruption and timeout risk.
+    v12 adds a validated batch solver because Track 1 evaluates a task array.
+    It keeps per-task fallback for any missing/invalid answer. This is designed to
+    reduce routing/correction mistakes while still satisfying the exact Docker contract.
     """
 
     def __init__(self, config: AgentConfig):
         self.config = config
+
+    def answer_tasks(self, tasks: list[dict[str, Any]]) -> list[dict[str, str]]:
+        if self.config.batch_solve and len(tasks) > 1:
+            batch = self._try_batch_solve(tasks)
+            if batch is not None:
+                return batch
+        return [self.answer_task(task) for task in tasks]
 
     def answer_task(self, task: dict[str, Any]) -> dict[str, str]:
         task_id = str(task.get("task_id", "")) or "missing_task_id"
@@ -66,8 +88,6 @@ class FireworksTrack1Agent:
 
         task_type = classify_task(prompt)
 
-        # High-confidence deterministic fast paths for common simple tasks.
-        # These are deliberately conservative; if not clearly safe, use Fireworks.
         if self.config.local_fast_paths:
             local = self._try_safe_local(prompt, task_type)
             if local:
@@ -85,12 +105,66 @@ class FireworksTrack1Agent:
             if repaired:
                 answer = _final_cleanup(repaired, task_type, prompt)
 
-        return {"task_id": task_id, "answer": answer.strip() or "Unable to produce a reliable answer."}
+        return {"task_id": task_id, "answer": answer.strip() or "I don't know."}
+
+    def _try_batch_solve(self, tasks: list[dict[str, Any]]) -> list[dict[str, str]] | None:
+        safe_tasks = []
+        for idx, t in enumerate(tasks):
+            tid = str(t.get("task_id", f"task_{idx}"))
+            prompt = str(t.get("prompt", "")).strip()
+            if prompt:
+                safe_tasks.append({"task_id": tid, "prompt": prompt})
+        if not safe_tasks:
+            return []
+
+        # For very large/code-heavy batches, direct per-task solving is safer.
+        total_chars = sum(len(t["prompt"]) for t in safe_tasks)
+        if total_chars > 16000 or len(safe_tasks) > 30:
+            return None
+
+        models = primary_models(self.config.allowed_models, None, limit=self.config.batch_candidate_count)
+        for model in models:
+            try:
+                messages = [
+                    {"role": "system", "content": BATCH_SYSTEM},
+                    {"role": "user", "content": json.dumps(safe_tasks, ensure_ascii=False)},
+                ]
+                raw = self._chat_completion(model, messages, self.config.batch_max_tokens)
+                parsed = _parse_batch_json(raw)
+                if not parsed:
+                    continue
+                by_id: dict[str, str] = {}
+                for item in parsed:
+                    if isinstance(item, dict) and "task_id" in item and "answer" in item:
+                        by_id[str(item["task_id"])] = str(item["answer"])
+                if len(by_id) < max(1, int(len(safe_tasks) * 0.75)):
+                    continue
+
+                results: list[dict[str, str]] = []
+                missing_or_bad = 0
+                for task in safe_tasks:
+                    tid = task["task_id"]
+                    prompt = task["prompt"]
+                    task_type = classify_task(prompt)
+                    ans = by_id.get(tid, "")
+                    ans = _final_cleanup(ans, task_type, prompt)
+                    if not ans or _looks_error(ans) or _needs_repair(ans, task_type, prompt):
+                        missing_or_bad += 1
+                        results.append(self.answer_task(task))
+                    else:
+                        results.append({"task_id": tid, "answer": ans})
+                # If batch was mostly bad, do not trust it.
+                if missing_or_bad > len(safe_tasks) * 0.4:
+                    return None
+                return results
+            except Exception:
+                continue
+        return None
 
     def _try_safe_local(self, prompt: str, task_type: TaskType) -> str | None:
         low = prompt.lower()
-        # Do not local-solve tasks with strict custom formats except very simple labels/numbers.
-        if any(k in low for k in ["json", "schema", "yaml", "xml", "table", "exactly", "at least", "at most"]):
+        # Never override strict JSON/table/exact-length tasks with heuristics except labels/numbers.
+        if any(k in low for k in ["json", "schema", "yaml", "xml", "table", "exactly", "at least", "at most", "no more than", "fewer than"]):
             if task_type not in {TaskType.SENTIMENT, TaskType.MATH}:
                 return None
         try:
@@ -100,20 +174,16 @@ class FireworksTrack1Agent:
         if not local:
             return None
         local = _final_cleanup(local, task_type, prompt)
-        if task_type == TaskType.SENTIMENT:
-            # Sentiment lexicon is usually more stable than weak small LLMs.
-            if re.search(r"\b(positive|negative|neutral|mixed|pos|neg)\b", local, flags=re.I):
-                return local
-        if task_type == TaskType.MATH:
-            # Use only single-number local answers for simple arithmetic/percentage tasks.
-            if re.fullmatch(r"[-+]?(?:\$)?\d[\d,]*(?:\.\d+)?%?(?:\s*[A-Za-z]+)?", local.strip()):
-                return local.strip()
-        if task_type == TaskType.CODE_GEN:
-            if re.search(r"\bdef\s+\w+\s*\(", local) and _requested_name_ok(prompt, local):
-                return local
-        if task_type == TaskType.CODE_DEBUG:
-            if "len(nums)" in local or ("bug" in local.lower() and "def " in local):
-                return local
+        if task_type == TaskType.SENTIMENT and re.search(r"\b(positive|negative|neutral|mixed|pos|neg)\b", local, flags=re.I):
+            return local
+        if task_type == TaskType.MATH and re.fullmatch(r"[-+]?(?:\$)?\d[\d,]*(?:\.\d+)?%?(?:\s*[A-Za-z]+)?", local.strip()):
+            return local.strip()
+        if task_type == TaskType.CODE_GEN and re.search(r"\bdef\s+\w+\s*\(", local) and _requested_name_ok(prompt, local):
+            return local
+        if task_type == TaskType.CODE_DEBUG and ("len(nums)" in local or ("bug" in local.lower() and "def " in local)):
+            return local
+        if task_type == TaskType.LOGIC and "=" in local and len(local) < 250:
+            return local
         return None
 
     def _solve(self, prompt: str, task_type: TaskType) -> str:
@@ -148,12 +218,10 @@ class FireworksTrack1Agent:
                 if ans and not _looks_error(ans):
                     return ans
             except Exception:
-                time.sleep(0.25)
                 continue
         return self._fallback(prompt, task_type)
 
     def _fallback(self, prompt: str, task_type: TaskType) -> str:
-        # Last chance: try usable models in harness order with a smaller max_tokens.
         last = ""
         for model in usable_models(self.config.allowed_models)[: max(1, self.config.max_retries)]:
             try:
@@ -163,7 +231,7 @@ class FireworksTrack1Agent:
                 last = ans or last
             except Exception:
                 continue
-        return last or "Unable to produce a reliable answer."
+        return last or "I don't know."
 
     def _direct(self, prompt: str, task_type: TaskType, model: str, max_tokens: int | None = None) -> str:
         messages = [
@@ -179,7 +247,7 @@ class FireworksTrack1Agent:
         candidate_text = "\n\n".join(f"Candidate {i+1}:\n{c}" for i, c in enumerate(candidates))
         messages = [
             {"role": "system", "content": SELECTOR_SYSTEM + "\n\n" + system_for(task_type)},
-            {"role": "user", "content": f"Original task:\n{prompt}\n\n{candidate_text}"},
+            {"role": "user", "content": f"Original task:\n{prompt}\n\n{candidate_text}\n\nReturn the single best final answer only."},
         ]
         try:
             selected = self._chat_completion(model, messages, _select_tokens(task_type))
@@ -193,7 +261,7 @@ class FireworksTrack1Agent:
             return None
         messages = [
             {"role": "system", "content": REPAIR_SYSTEM + "\n\n" + system_for(task_type)},
-            {"role": "user", "content": f"Original task:\n{prompt}\n\nInvalid answer:\n{bad_answer}\n\nReturn the corrected final answer only."},
+            {"role": "user", "content": f"Original task:\n{prompt}\n\nInvalid or incomplete answer:\n{bad_answer}\n\nReturn the corrected final answer only."},
         ]
         try:
             return self._chat_completion(model, messages, _select_tokens(task_type))
@@ -209,51 +277,84 @@ class FireworksTrack1Agent:
             "top_p": 1,
             "max_tokens": max_tokens,
         }
-        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=data,
-            method="POST",
-            headers={
-                "Authorization": f"Bearer {self.config.api_key}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            },
-        )
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        last_error = None
+        for attempt in range(max(1, self.config.max_retries)):
+            req = urllib.request.Request(
+                url,
+                data=body,
+                method="POST",
+                headers={
+                    "Authorization": f"Bearer {self.config.api_key}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=self.config.request_timeout_seconds) as resp:
+                    raw = resp.read().decode("utf-8")
+                parsed = json.loads(raw)
+                return _extract_chat_content(parsed)
+            except urllib.error.HTTPError as exc:
+                err_body = exc.read().decode("utf-8", errors="replace")[:700]
+                last_error = RuntimeError(f"HTTP {exc.code} from Fireworks proxy: {err_body}")
+                if exc.code not in {408, 409, 425, 429, 500, 502, 503, 504}:
+                    break
+            except Exception as exc:
+                last_error = exc
+            time.sleep(min(4.0, 0.6 * (2 ** attempt)))
+        raise RuntimeError(str(last_error) if last_error else "Fireworks request failed")
+
+
+def _extract_chat_content(parsed: dict[str, Any]) -> str:
+    choices = parsed.get("choices") or []
+    if not choices:
+        raise RuntimeError(f"No choices in response: {str(parsed)[:700]}")
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        raise RuntimeError(f"Malformed choice: {str(parsed)[:700]}")
+    message = choice.get("message")
+    if isinstance(message, dict):
+        content = message.get("content")
+        if isinstance(content, str):
+            return _remove_thinking(content).strip()
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, dict):
+                    txt = item.get("text") or item.get("content")
+                    if isinstance(txt, str):
+                        parts.append(txt)
+                elif isinstance(item, str):
+                    parts.append(item)
+            if parts:
+                return _remove_thinking("\n".join(parts)).strip()
+    if isinstance(choice.get("text"), str):
+        return _remove_thinking(choice["text"]).strip()
+    raise RuntimeError(f"Cannot extract message content: {str(parsed)[:700]}")
+
+
+def _parse_batch_json(text: str) -> list[dict[str, Any]] | None:
+    if not text:
+        return None
+    text = _remove_thinking(text).strip()
+    # Strip markdown fences if present.
+    text = re.sub(r"^```(?:json)?\s*", "", text.strip(), flags=re.I)
+    text = re.sub(r"\s*```$", "", text.strip())
+    candidates = [text]
+    s, e = text.find("["), text.rfind("]")
+    if s != -1 and e != -1 and e > s:
+        candidates.append(text[s:e+1])
+    for cand in candidates:
         try:
-            with urllib.request.urlopen(req, timeout=self.config.request_timeout_seconds) as resp:
-                raw = resp.read().decode("utf-8")
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"HTTP {exc.code} from Fireworks proxy: {body[:700]}") from exc
-
-        parsed = json.loads(raw)
-        choices = parsed.get("choices") or []
-        if not choices:
-            raise RuntimeError(f"No choices in response: {raw[:700]}")
-        choice = choices[0]
-        if not isinstance(choice, dict):
-            raise RuntimeError(f"Malformed choice: {raw[:700]}")
-        message = choice.get("message")
-        if isinstance(message, dict):
-            content = message.get("content")
-            if isinstance(content, str):
-                return _remove_thinking(content).strip()
-            if isinstance(content, list):
-                parts: list[str] = []
-                for item in content:
-                    if isinstance(item, dict):
-                        txt = item.get("text") or item.get("content")
-                        if isinstance(txt, str):
-                            parts.append(txt)
-                    elif isinstance(item, str):
-                        parts.append(item)
-                if parts:
-                    return _remove_thinking("\n".join(parts)).strip()
-        if isinstance(choice.get("text"), str):
-            return _remove_thinking(choice["text"]).strip()
-        raise RuntimeError(f"Cannot extract message content: {raw[:700]}")
-
+            parsed = json.loads(cand)
+            if isinstance(parsed, list):
+                return parsed
+            if isinstance(parsed, dict) and isinstance(parsed.get("results"), list):
+                return parsed["results"]
+        except Exception:
+            continue
+    return None
 
 # ------------------------- utilities -------------------------
 
