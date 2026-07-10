@@ -1,41 +1,65 @@
-# FireRoute AI — Track 1 Accuracy v10
+# FireRoute AI — Track 1 Accuracy v11
 
-FireRoute AI is a Dockerized Track 1 agent for the AMD Developer Hackathon ACT II. It reads `/input/tasks.json`, solves each natural language task using Fireworks AI through the harness-provided environment, and writes `/output/results.json`.
+This is a reliability-first Track 1 project for the AMD Developer Hackathon ACT II.
 
-## Why v10 exists
+## What it does
 
-Previous builds improved the container but plateaued around 63.2% hidden accuracy. v10 changes the strategy again:
+The container:
 
-- Category-specific model calibration from `ALLOWED_MODELS`.
-- Original prompt is still sent directly to the model.
-- A self-check/correction pass is enabled for maximum correctness.
-- Local shortcut solvers are disabled by default to avoid hidden benchmark mismatches.
-- Stronger prompt rules for exact formats, code signatures, JSON, units, and labels.
-- `linux/amd64` GHCR publish workflow is included.
+1. Reads tasks from `/input/tasks.json`
+2. Solves each task using Fireworks AI through the harness-provided environment
+3. Writes valid answers to `/output/results.json`
+4. Exits with code `0` on success
 
-## Official Track 1 contract
+It supports the 8 Track 1 categories:
 
-The final container must:
+- factual knowledge
+- mathematical reasoning
+- sentiment classification
+- text summarization
+- named entity recognition
+- code debugging
+- logical / deductive reasoning
+- code generation
 
-1. Read input from `/input/tasks.json`.
-2. Write output to `/output/results.json`.
-3. Read these variables from the runtime environment:
-   - `FIREWORKS_API_KEY`
-   - `FIREWORKS_BASE_URL`
-   - `ALLOWED_MODELS`
-4. Route all Fireworks calls through `FIREWORKS_BASE_URL`.
-5. Avoid hardcoded model IDs and API keys.
-6. Build/publish as `linux/amd64`.
+## Important v11 strategy
 
-## Docker image
+Previous versions plateaued around 57–63% accuracy. v11 is built to reduce the most likely causes:
 
-Recommended image reference:
+- no category calibration calls that can waste runtime or choose badly
+- no global self-check that can corrupt already-correct answers
+- original hidden prompt is sent to Fireworks unchanged
+- harness model order is trusted more strongly
+- ensemble is used only for hard tasks: math, logic, debugging, and code generation
+- conservative local fast paths are used only for simple high-confidence cases
+- sentiment cleanup bug fixed: answers starting with `Mixed` no longer get changed to `Positive`
+- all calls still go through `FIREWORKS_BASE_URL`
+
+I cannot guarantee a specific hidden score because lablab.ai does not show failed prompts, but this version is designed to be more reliable than the v8/v9/v10 strategies.
+
+## Required environment variables
+
+The official judge injects these values at runtime:
 
 ```bash
-ghcr.io/marcusviniciusbispodossantos/fireroute-ai:latest
+FIREWORKS_API_KEY
+FIREWORKS_BASE_URL
+ALLOWED_MODELS
 ```
 
-## Build manually
+Do not commit a real `.env` file. The submitted image reads these variables from the environment.
+
+## Local / CI mock test
+
+The mock test does not test real model accuracy. It only confirms Docker contract compatibility.
+
+```bash
+bash scripts/test_with_mock.sh
+```
+
+## Build linux/amd64 image
+
+The judging VM runs `linux/amd64`, so the image must include a linux/amd64 manifest.
 
 ```bash
 docker buildx build \
@@ -45,27 +69,17 @@ docker buildx build \
   .
 ```
 
-## Runtime configuration
-
-Official judging injects the three Fireworks variables. Do not commit a real `.env` file.
-
-v10 accuracy-first defaults:
-
-```bash
-ENABLE_LOCAL_FAST_PATHS=0
-ENABLE_CATEGORY_CALIBRATION=1
-CALIBRATION_MODEL_LIMIT=4
-SELF_CHECK_MODE=all
-MAX_WORKERS=2
-MAX_RETRIES=6
-REQUEST_TIMEOUT_SECONDS=25
-```
-
 ## GitHub Actions
 
-Run these workflows after pushing changes:
+Use these workflows:
 
-1. **Track 1 Online Check** — validates the Docker contract using a mock Fireworks server.
-2. **Publish Docker Image to GHCR** — builds and pushes the public `linux/amd64` image.
+- `Track 1 Online Check` — verifies the container contract with a mock Fireworks server
+- `Publish Docker Image to GHCR` — builds and pushes the `linux/amd64` image
 
-After publishing, re-save the lablab.ai submission so the platform pulls the newest image.
+After publishing, re-save the lablab.ai submission so the platform pulls the latest image.
+
+## Submission image
+
+```text
+ghcr.io/marcusviniciusbispodossantos/fireroute-ai:latest
+```
