@@ -1,80 +1,56 @@
-# FireRoute AI — Track 1 Accuracy v12
+# FireRoute AI — Track 1 Accuracy v13 Lite
 
-This is a Dockerized Track 1 agent for the AMD Developer Hackathon ACT II.
+FireRoute AI is a Dockerized Track 1 agent for the AMD Developer Hackathon ACT II. It reads `/input/tasks.json`, solves each task, and writes `/output/results.json`.
 
-## What changed in v12
+## Why v13 Lite
 
-v12 is a correctness-first rebuild after the previous versions plateaued around 63%.
+Previous versions improved accuracy but used too many calls or risky correction passes. v13 Lite is designed for **accuracy with a low token budget**:
 
-Key changes:
+- high-confidence local solvers for math, sentiment, common code templates, simple debugging, and assignment logic;
+- exactly one concise Fireworks call for remaining tasks;
+- original prompt is sent unchanged;
+- no batch solving, no global verifier, no calibration calls;
+- short system prompt and capped output tokens to target less than ~1400 recorded tokens on small hidden batches.
 
-- Validated batch solving for the full `/input/tasks.json` array.
-- Per-task fallback for any missing or invalid batch answer.
-- Stronger model ranking from `ALLOWED_MODELS`.
-- Robust retry handling for 429/5xx/timeout proxy errors.
-- Original prompts are preserved; the agent does not hardcode hidden answers.
-- Conservative deterministic solvers only for safe math, sentiment, simple logic, and common code tasks.
-- `linux/amd64` GHCR publishing workflow included.
+I cannot guarantee 85% because hidden prompts are not visible, but this version is built to avoid the failures seen in v10/v12 while keeping token usage close to the previous ~1300-token successful project.
 
-## Official Track 1 contract
+## Required environment variables
 
-The container:
-
-1. Reads tasks from `/input/tasks.json`.
-2. Writes results to `/output/results.json`.
-3. Reads these environment variables from the judging harness:
-   - `FIREWORKS_API_KEY`
-   - `FIREWORKS_BASE_URL`
-   - `ALLOWED_MODELS`
-4. Sends all Fireworks calls through `FIREWORKS_BASE_URL`.
-5. Does not hardcode model IDs.
-6. Exits with code 0 on success.
-
-## Docker image
-
-Final image reference:
+The final judging harness injects these:
 
 ```bash
-ghcr.io/marcusviniciusbispodossantos/fireroute-ai:latest
+FIREWORKS_API_KEY
+FIREWORKS_BASE_URL
+ALLOWED_MODELS
 ```
 
-The image must be public and include a `linux/amd64` manifest.
+The project does not hardcode keys or model IDs.
 
-## Online validation
+## Build linux/amd64 image
 
-Run:
-
-```text
-GitHub → Actions → Track 1 Online Check → Run workflow
+```bash
+docker buildx build --platform linux/amd64 -t ghcr.io/marcusviniciusbispodossantos/fireroute-ai:latest --push .
 ```
 
-Then publish:
+## Run contract-style
 
-```text
-GitHub → Actions → Publish Docker Image to GHCR → Run workflow
+```bash
+docker run --rm \
+  -e FIREWORKS_API_KEY=dummy \
+  -e FIREWORKS_BASE_URL=http://127.0.0.1:8000/v1 \
+  -e ALLOWED_MODELS=mock-model \
+  -v "$PWD/input:/input" \
+  -v "$PWD/output:/output" \
+  ghcr.io/marcusviniciusbispodossantos/fireroute-ai:latest
 ```
 
-After publishing, re-save the lablab.ai submission so it pulls the new image.
+## Default accuracy/token settings
 
-## Environment defaults
-
-Accuracy-first defaults are set in the Dockerfile:
-
-```env
-BATCH_SOLVE=1
-BATCH_CANDIDATES=1
-ENSEMBLE_MODE=hard
+```bash
 ENABLE_LOCAL_FAST_PATHS=1
+HARD_SECOND_TRY=0
 MAX_WORKERS=1
-MAX_RETRIES=4
-HARD_ENSEMBLE_SIZE=2
-REQUEST_TIMEOUT_SECONDS=40
+MODEL_ORDER=hybrid
 ```
 
-If v12 does not improve, try one controlled variation by editing Dockerfile:
-
-```env
-BATCH_SOLVE=0
-```
-
-Then republish and re-save. This isolates whether batch solving helps or hurts the hidden benchmark.
+If accuracy is still below threshold and tokens are acceptable, try `HARD_SECOND_TRY=1` in the Dockerfile/environment, but that may exceed 1400 tokens.

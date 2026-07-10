@@ -1,13 +1,9 @@
-.git
-.github
 .env
 .env.*
 !.env.example
-__pycache__
+__pycache__/
 *.pyc
-input
-output
+.git/
+input/
+output/
 samples/results.json
-*.zip
-*.rar
-.DS_Store

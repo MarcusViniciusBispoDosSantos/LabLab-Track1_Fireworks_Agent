@@ -1,34 +1,10 @@
 [
-  {
-    "task_id": "factual1",
-    "prompt": "Explain what Kubernetes is in exactly 3 concise sentences."
-  },
-  {
-    "task_id": "math1",
-    "prompt": "A company has 1,200 users. It grows by 15% in January and then loses 8% in February. How many users does it have after February?"
-  },
-  {
-    "task_id": "sentiment1",
-    "prompt": "Classify the sentiment and justify briefly: The dashboard is fast and clean, but the export button fails every time."
-  },
-  {
-    "task_id": "summary1",
-    "prompt": "Summarise this in one sentence: Cloud computing lets companies rent servers, storage, databases, and networking over the internet instead of buying physical infrastructure. It improves scalability, lowers upfront cost, and enables faster deployment."
-  },
-  {
-    "task_id": "ner1",
-    "prompt": "Extract named entities and label them: On July 4, 2026, Maria Santos joined AMD in Austin, Texas."
-  },
-  {
-    "task_id": "debug1",
-    "prompt": "Find and fix the bug in this Python function:\n\ndef average(nums):\n    total = 0\n    for n in nums:\n        total += n\n    return total / len(num)"
-  },
-  {
-    "task_id": "logic1",
-    "prompt": "Alice, Bob, and Carla each own one pet: cat, dog, or bird. Alice does not own the dog. Bob does not own the cat. Carla owns the bird. Who owns each pet?"
-  },
-  {
-    "task_id": "codegen1",
-    "prompt": "Write a Python function called is_palindrome(text) that returns True if text is a palindrome ignoring spaces, punctuation, and case."
-  }
+  {"task_id":"factual1","prompt":"Explain what Kubernetes is in exactly 3 concise sentences."},
+  {"task_id":"math1","prompt":"A company has 1,200 users. It grows by 15% in January and then loses 8% in February. How many users does it have after February?"},
+  {"task_id":"sentiment1","prompt":"Classify the sentiment: The dashboard is fast and clean, but the export button fails every time."},
+  {"task_id":"summary1","prompt":"Summarise this in one sentence: Cloud computing lets companies rent servers, storage, databases, and networking over the internet instead of buying physical infrastructure."},
+  {"task_id":"ner1","prompt":"Extract named entities and label them: On July 4, 2026, Maria Santos joined AMD in Austin, Texas."},
+  {"task_id":"debug1","prompt":"Find and fix the bug in this Python function:\n\ndef average(nums):\n    total = 0\n    for n in nums:\n        total += n\n    return total / len(num)"},
+  {"task_id":"logic1","prompt":"Alice, Bob, and Carla each own one pet: cat, dog, or bird. Alice does not own the dog. Bob does not own the cat. Carla owns the bird. Who owns each pet?"},
+  {"task_id":"codegen1","prompt":"Write a Python function called is_palindrome(text) that returns True if text is a palindrome ignoring spaces, punctuation, and case."}
 ]
