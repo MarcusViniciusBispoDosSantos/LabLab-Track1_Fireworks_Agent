@@ -10,223 +10,303 @@ from dataclasses import dataclass
 from typing import Any
 
 from .classifier import TaskType, classify_task
-from .models import best_model, ranked_models, secondary_models, is_reasoning_model
-from .prompts import system_for
-from .solvers import try_local
+from .models import is_thinking_model, parse_allowed_models, ranked_models
+from .prompts import TASK_SYSTEMS, VERIFIER_SYSTEM
+from .solvers import try_solve_locally
+
 
 @dataclass(frozen=True)
 class AgentConfig:
     api_key: str
     base_url: str
     allowed_models: list[str]
-    timeout: float = 35.0
-    retries: int = 3
-    local_fast_paths: bool = True
-    max_api_tasks: int = 999
-    hard_second_try: bool = False
+    request_timeout_seconds: float = 29.0
+    max_retries: int = 3
+    verify_mode: str = "all"  # none | hard | all
+    local_fast_paths: bool = False
 
     @classmethod
-    def from_env(cls) -> 'AgentConfig':
-        missing = [k for k in ('FIREWORKS_API_KEY','FIREWORKS_BASE_URL','ALLOWED_MODELS') if not os.getenv(k)]
+    def from_env(cls) -> "AgentConfig":
+        required = ("FIREWORKS_API_KEY", "FIREWORKS_BASE_URL", "ALLOWED_MODELS")
+        missing = [name for name in required if not os.getenv(name)]
         if missing:
-            raise RuntimeError('Missing required environment variable(s): ' + ', '.join(missing))
-        models = [m.strip() for m in os.environ['ALLOWED_MODELS'].replace('\n', ',').split(',') if m.strip()]
+            raise RuntimeError("Missing required environment variable(s): " + ", ".join(missing))
+
+        timeout = float(os.getenv("REQUEST_TIMEOUT_SECONDS", "29"))
+        retries = int(os.getenv("MAX_RETRIES", "3"))
+        legacy_verify = os.getenv("VERIFY_HARD_TASKS", "").strip().lower()
+        verify_mode = os.getenv("VERIFY_MODE", "all").strip().lower()
+        if legacy_verify in {"0", "false", "no", "off"} and "VERIFY_MODE" not in os.environ:
+            verify_mode = "none"
+        if verify_mode not in {"none", "hard", "all"}:
+            verify_mode = "all"
+
+        # v5 default: let the strongest LLM solve tasks. Regex fast paths are useful for
+        # smoke tests, but hidden benchmark prompts are varied, so they are opt-in.
+        local_fast_paths = os.getenv("ENABLE_LOCAL_FAST_PATHS", "0").strip().lower() in {"1", "true", "yes", "on"}
+
         return cls(
-            api_key=os.environ['FIREWORKS_API_KEY'],
-            base_url=os.environ['FIREWORKS_BASE_URL'].rstrip('/'),
-            allowed_models=models,
-            timeout=float(os.getenv('REQUEST_TIMEOUT_SECONDS','35')),
-            retries=max(1, int(os.getenv('MAX_RETRIES','3'))),
-            local_fast_paths=os.getenv('ENABLE_LOCAL_FAST_PATHS','1').lower() in {'1','true','yes','on'},
-            max_api_tasks=max(1, int(os.getenv('MAX_API_TASKS','999'))),
-            hard_second_try=os.getenv('HARD_SECOND_TRY','0').lower() in {'1','true','yes','on'},
+            api_key=os.environ["FIREWORKS_API_KEY"],
+            base_url=os.environ["FIREWORKS_BASE_URL"].rstrip("/"),
+            allowed_models=parse_allowed_models(os.environ["ALLOWED_MODELS"]),
+            request_timeout_seconds=timeout,
+            max_retries=max(0, retries),
+            verify_mode=verify_mode,
+            local_fast_paths=local_fast_paths,
         )
 
-class FireworksTrack1Agent:
-    '''v13 token-aware accuracy agent.
 
-    Goal: recover accuracy while keeping proxy tokens low. It solves very high-confidence
-    math/sentiment/template-code/assignment-logic locally, then makes exactly one concise
-    Fireworks call for remaining tasks. Optional HARD_SECOND_TRY is disabled by default to
-    stay near the user's <1400-token target.
-    '''
+class FireworksTrack1Agent:
     def __init__(self, config: AgentConfig):
         self.config = config
-        self.api_calls = 0
-
-    def answer_tasks(self, tasks: list[dict[str, Any]]) -> list[dict[str, str]]:
-        return [self.answer_task(t) for t in tasks]
 
     def answer_task(self, task: dict[str, Any]) -> dict[str, str]:
-        tid = str(task.get('task_id','')) or 'missing_task_id'
-        prompt = str(task.get('prompt','')).strip()
+        task_id = str(task.get("task_id", "")) or "missing_task_id"
+        prompt = str(task.get("prompt", "")).strip()
         if not prompt:
-            return {'task_id': tid, 'answer': ''}
-        typ = classify_task(prompt)
+            return {"task_id": task_id, "answer": ""}
 
-        # Safe local exact solvers use zero proxy tokens and are restricted to high-confidence patterns.
+        task_type = classify_task(prompt)
+
+        # Opt-in only. Hidden evaluation is diverse; model answer is safer by default.
         if self.config.local_fast_paths:
-            local = try_local(prompt, typ)
-            if local and _safe_to_use_local(local, typ, prompt):
-                return {'task_id': tid, 'answer': cleanup(local, typ, prompt)}
-
-        if self.api_calls >= self.config.max_api_tasks:
-            return {'task_id': tid, 'answer': fallback_answer(prompt, typ)}
+            local = try_solve_locally(prompt, task_type)
+            if local:
+                return {"task_id": task_id, "answer": _clean_answer(local, task_type, prompt)}
 
         try:
-            ans = self.direct(prompt, typ, best_model(self.config.allowed_models, typ))
-            ans = cleanup(ans, typ, prompt)
-            if self.config.hard_second_try and typ in {TaskType.MATH, TaskType.LOGIC, TaskType.CODE_DEBUG, TaskType.CODE_GEN} and needs_fix(ans, typ, prompt):
-                for model in secondary_models(self.config.allowed_models, typ, 2)[1:]:
-                    if self.api_calls >= self.config.max_api_tasks: break
-                    ans2 = cleanup(self.direct(prompt, typ, model), typ, prompt)
-                    if ans2 and not needs_fix(ans2, typ, prompt):
-                        ans = ans2; break
-            if not ans:
-                ans = fallback_answer(prompt, typ)
-            return {'task_id': tid, 'answer': ans}
+            answer = self._generate_answer(prompt, task_type)
         except Exception:
-            return {'task_id': tid, 'answer': fallback_answer(prompt, typ)}
+            # Route failures can happen with unusual prompts; retry with universal route.
+            answer = self._generate_answer(prompt, TaskType.FACTUAL)
 
-    def direct(self, prompt: str, typ: TaskType, model: str) -> str:
-        self.api_calls += 1
+        if self._should_verify(task_type):
+            try:
+                answer = self._verify_answer(prompt, answer, task_type)
+            except Exception:
+                # Keeping the original generated answer is better than emitting an error string.
+                pass
+
+        answer = _clean_answer(answer, task_type, prompt)
+        if not answer:
+            try:
+                answer = _clean_answer(self._generate_answer(prompt, TaskType.FACTUAL), task_type, prompt)
+            except Exception:
+                answer = "No answer produced."
+        return {"task_id": task_id, "answer": answer}
+
+    def _should_verify(self, task_type: TaskType) -> bool:
+        if self.config.verify_mode == "none":
+            return False
+        if self.config.verify_mode == "all":
+            return True
+        return task_type in {TaskType.MATH, TaskType.LOGIC, TaskType.CODE_DEBUG, TaskType.CODE_GEN}
+
+    def _generate_answer(self, prompt: str, task_type: TaskType) -> str:
         messages = [
-            {'role': 'system', 'content': system_for(typ)},
-            {'role': 'user', 'content': add_reasoning_guard(prompt, model)},
+            {"role": "system", "content": TASK_SYSTEMS[task_type]},
+            {"role": "user", "content": _task_user_message(prompt, task_type)},
         ]
-        payload = {'model': model, 'messages': messages, 'temperature': 0, 'top_p': 1, 'max_tokens': max_tokens(typ)}
-        body = json.dumps(payload, ensure_ascii=False).encode('utf-8')
-        url = self.config.base_url if self.config.base_url.endswith('/chat/completions') else self.config.base_url + '/chat/completions'
-        last = None
-        for i in range(self.config.retries):
-            req = urllib.request.Request(url, data=body, method='POST', headers={
-                'Authorization': 'Bearer ' + self.config.api_key,
-                'Content-Type': 'application/json', 'Accept': 'application/json'
-            })
+        return self._call_best_available(messages, task_type, _max_tokens_for(task_type))
+
+    def _verify_answer(self, prompt: str, draft: str, task_type: TaskType) -> str:
+        messages = [
+            {"role": "system", "content": VERIFIER_SYSTEM},
+            {"role": "user", "content": f"Original task category: {task_type.value}\n\nOriginal task:\n{prompt}\n\nDraft answer:\n{draft}"},
+        ]
+        return self._call_best_available(messages, task_type, _verify_max_tokens_for(task_type))
+
+    def _call_best_available(
+        self,
+        messages: list[dict[str, str]],
+        task_type: TaskType,
+        max_tokens: int,
+    ) -> str:
+        candidates = ranked_models(self.config.allowed_models, task_type)
+        if not candidates:
+            raise RuntimeError("No usable models found in ALLOWED_MODELS")
+
+        last_error: Exception | None = None
+        max_attempts = max(1, min(len(candidates), self.config.max_retries + 1))
+
+        for attempts, model in enumerate(candidates[:max_attempts], start=1):
             try:
-                with urllib.request.urlopen(req, timeout=self.config.timeout) as r:
-                    data = json.loads(r.read().decode('utf-8'))
-                return extract_content(data)
-            except urllib.error.HTTPError as e:
-                last = f'HTTP {e.code}: {e.read().decode("utf-8", errors="replace")[:400]}'
-                if e.code not in {408,409,425,429,500,502,503,504}: break
-            except Exception as e:
-                last = str(e)
-            time.sleep(min(2.0, 0.4 * (2 ** i)))
-        raise RuntimeError(last or 'request failed')
+                model_max_tokens = max_tokens
+                if is_thinking_model(model):
+                    model_max_tokens = min(max(max_tokens, 1800), 3200)
+                content = self._chat_completion(
+                    model=model,
+                    messages=messages,
+                    max_tokens=model_max_tokens,
+                )
+                cleaned = _remove_thinking(content).strip()
+                if cleaned:
+                    return cleaned
+                # If thinking output consumed the whole answer, try the same model once with
+                # a stricter final-only instruction and a smaller token budget.
+                content = self._chat_completion(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": "Return only the final answer. No reasoning, no explanation unless requested."},
+                        messages[-1],
+                    ],
+                    max_tokens=max_tokens,
+                )
+                if content.strip():
+                    return content.strip()
+                last_error = RuntimeError(f"Empty response from {model}")
+            except Exception as exc:
+                last_error = exc
+                # Back off for transient 429/5xx proxy errors.
+                time.sleep(min(0.8 * attempts, 3.0))
 
-def add_reasoning_guard(prompt: str, model: str) -> str:
-    if is_reasoning_model(model):
-        return prompt + '\n\nReturn only the final answer. Do not include chain-of-thought or <think> text.'
-    return prompt
+        raise RuntimeError(f"All model attempts failed. Last error: {last_error}")
 
-def extract_content(data: dict[str, Any]) -> str:
-    choices = data.get('choices') or []
-    if not choices: raise RuntimeError('no choices')
-    c = choices[0]
-    msg = c.get('message') if isinstance(c, dict) else None
-    if isinstance(msg, dict):
-        content = msg.get('content')
-        if isinstance(content, str): return remove_thinking(content).strip()
-        if isinstance(content, list):
-            parts=[]
-            for x in content:
-                if isinstance(x, dict):
-                    t=x.get('text') or x.get('content')
-                    if isinstance(t, str): parts.append(t)
-                elif isinstance(x, str): parts.append(x)
-            return remove_thinking('\n'.join(parts)).strip()
-    if isinstance(c, dict) and isinstance(c.get('text'), str): return remove_thinking(c['text']).strip()
-    raise RuntimeError('bad response')
+    def _chat_completion(self, model: str, messages: list[dict[str, str]], max_tokens: int) -> str:
+        """Call Fireworks through FIREWORKS_BASE_URL using only Python stdlib."""
+        url = _chat_completions_url(self.config.base_url)
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": 0,
+            "top_p": 1,
+            "max_tokens": max_tokens,
+        }
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {self.config.api_key}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+        )
 
-def max_tokens(t: TaskType) -> int:
-    # Intentionally small to target <1400 proxy tokens. Increase CODE_GEN only when needed.
+        try:
+            with urllib.request.urlopen(req, timeout=self.config.request_timeout_seconds) as resp:
+                raw = resp.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"HTTP {exc.code} from Fireworks proxy: {body[:700]}") from exc
+
+        parsed = json.loads(raw)
+        choices = parsed.get("choices") or []
+        if not choices:
+            raise RuntimeError(f"No choices in response: {raw[:700]}")
+        first = choices[0]
+        if not isinstance(first, dict):
+            raise RuntimeError(f"Malformed choice: {raw[:700]}")
+
+        message = first.get("message")
+        if isinstance(message, dict):
+            content = message.get("content")
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                parts: list[str] = []
+                for item in content:
+                    if isinstance(item, dict):
+                        if isinstance(item.get("text"), str):
+                            parts.append(item["text"])
+                        elif item.get("type") == "text" and isinstance(item.get("content"), str):
+                            parts.append(item["content"])
+                    elif isinstance(item, str):
+                        parts.append(item)
+                if parts:
+                    return "\n".join(parts)
+        text = first.get("text")
+        if isinstance(text, str):
+            return text
+        raise RuntimeError(f"Could not parse assistant content: {raw[:700]}")
+
+
+def _task_user_message(prompt: str, task_type: TaskType) -> str:
+    return (
+        f"Route hint: {task_type.value}\n"
+        "Solve the original task below. The route hint may be wrong; the original task is authoritative. "
+        "Return only the final answer in the requested format.\n\n"
+        f"Original task:\n{prompt}"
+    )
+
+
+def _chat_completions_url(base_url: str) -> str:
+    base = base_url.rstrip("/")
+    if base.endswith("/chat/completions"):
+        return base
+    return base + "/chat/completions"
+
+
+def _max_tokens_for(task_type: TaskType) -> int:
     return {
-        TaskType.FACTUAL: 120,
-        TaskType.MATH: 180,
-        TaskType.SENTIMENT: 60,
-        TaskType.SUMMARY: 140,
-        TaskType.NER: 170,
-        TaskType.CODE_DEBUG: 420,
-        TaskType.LOGIC: 260,
-        TaskType.CODE_GEN: 520,
-    }[t]
+        TaskType.FACTUAL: 700,
+        TaskType.MATH: 1000,
+        TaskType.SENTIMENT: 240,
+        TaskType.SUMMARY: 450,
+        TaskType.NER: 700,
+        TaskType.CODE_DEBUG: 1800,
+        TaskType.LOGIC: 1200,
+        TaskType.CODE_GEN: 2200,
+    }[task_type]
 
-def remove_thinking(text: str) -> str:
-    s = (text or '').strip()
-    s = re.sub(r'<think>.*?</think>', '', s, flags=re.I|re.S).strip()
-    if '</think>' in s.lower(): s = re.split(r'</think>', s, flags=re.I)[-1].strip()
-    m = re.fullmatch(r'(?:final\s+answer|answer|result)\s*:\s*(.+)', s, flags=re.I|re.S)
-    return m.group(1).strip() if m else s
 
-def cleanup(ans: str, typ: TaskType, prompt: str) -> str:
-    s = remove_thinking(ans).strip()
-    s = re.sub(r'^```(?:\w+)?\s*', '', s).strip()
-    s = re.sub(r'\s*```$', '', s).strip()
-    s = re.sub(r'^(?:Sure|Of course)[,.!]?\s*', '', s, flags=re.I).strip()
-    lowp = prompt.lower()
-    if typ == TaskType.SENTIMENT:
-        lab = sentiment_label(s, prompt)
-        if lab: return lab
-    if 'json' in lowp:
-        j = extract_json(s)
-        if j: return j
-    if re.search(r'\b(answer yes or no|yes/no)\b', lowp):
-        yn = re.search(r'\b(yes|no)\b', s, re.I)
-        if yn: return yn.group(1).capitalize()
-    if re.search(r'\b(true or false|true/false)\b', lowp):
-        tf = re.search(r'\b(true|false)\b', s, re.I)
-        if tf: return tf.group(1).capitalize()
-    if 'final number only' in lowp or 'answer only' in lowp or 'final answer only' in lowp:
-        line = [x.strip() for x in s.splitlines() if x.strip()]
-        if line: return line[-1]
-    return s
+def _verify_max_tokens_for(task_type: TaskType) -> int:
+    return {
+        TaskType.FACTUAL: 650,
+        TaskType.MATH: 900,
+        TaskType.SENTIMENT: 220,
+        TaskType.SUMMARY: 420,
+        TaskType.NER: 650,
+        TaskType.CODE_DEBUG: 1800,
+        TaskType.LOGIC: 1100,
+        TaskType.CODE_GEN: 2200,
+    }[task_type]
 
-def sentiment_label(text: str, prompt: str) -> str | None:
-    labels = requested_labels(prompt) or ['positive','negative','neutral','mixed']
-    # Prefer first valid label mentioned in answer.
-    for lab in labels:
-        if re.search(rf'\b{re.escape(lab)}\b', text, re.I):
-            return lab.capitalize()
-    return None
 
-def requested_labels(prompt: str) -> list[str] | None:
-    low = prompt.lower()
-    known = [x for x in ['positive','negative','neutral','mixed'] if re.search(rf'\b{x}\b', low)]
-    return known if len(known) >= 2 else None
+def _clean_answer(answer: str, task_type: TaskType, prompt: str = "") -> str:
+    text = answer.strip()
+    text = _remove_thinking(text)
+    text = re.sub(r"^\s*(final answer|answer|result)\s*:\s*", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"^\s*Here is (?:the )?", "", text, flags=re.IGNORECASE).strip()
 
-def extract_json(s: str) -> str | None:
-    for start, end in [('{','}'), ('[',']')]:
-        a, b = s.find(start), s.rfind(end)
-        if a != -1 and b > a:
-            cand = s[a:b+1]
-            try:
-                json.loads(cand); return cand
-            except Exception: pass
-    return None
+    # Remove surrounding single markdown fence when code-only is requested.
+    if task_type == TaskType.CODE_GEN:
+        text = _strip_single_code_fence(text)
+        text = re.sub(
+            r"^(?:the )?(?:Python|JavaScript|TypeScript|Java|C\+\+|SQL)?\s*code(?: is)?:?\s*",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        ).strip()
 
-def needs_fix(ans: str, typ: TaskType, prompt: str) -> bool:
-    if not ans: return True
-    low = ans.lower()
-    if any(x in low for x in ['traceback', 'cannot answer', 'i don\'t know', 'error:']): return True
-    if typ == TaskType.MATH and not re.search(r'[-+]?\d', ans): return True
-    if typ == TaskType.SENTIMENT and not sentiment_label(ans, prompt): return True
-    if typ == TaskType.CODE_GEN and ('function' in prompt.lower() or 'python' in prompt.lower()) and not re.search(r'\bdef\s+\w+\s*\(', ans): return True
-    return False
+    # If the model returns a quoted JSON/code block with extra lead-in, prefer fenced code.
+    if task_type in {TaskType.CODE_GEN, TaskType.CODE_DEBUG}:
+        fenced = re.search(r"```(?:[a-zA-Z0-9_+\-.#]*)?\s*\n(?P<code>.*?)\n```", text, flags=re.DOTALL)
+        if fenced and ("return code" in prompt.lower() or task_type == TaskType.CODE_GEN):
+            text = fenced.group("code").strip()
 
-def fallback_answer(prompt: str, typ: TaskType) -> str:
-    # This should rarely be used; keep it valid and concise.
-    if typ == TaskType.SENTIMENT: return 'Neutral'
-    if typ == TaskType.NER: return 'No named entities found.'
-    return 'I don\'t know.'
+    return text.strip()
 
-def _safe_to_use_local(ans: str, typ: TaskType, prompt: str) -> bool:
-    if not ans: return False
-    lowp = prompt.lower()
-    if any(x in lowp for x in ['exactly', 'json', 'xml', 'yaml', 'table']) and typ not in {TaskType.MATH, TaskType.SENTIMENT}:
-        return False
-    if typ == TaskType.MATH: return bool(re.search(r'[-+]?\d', ans)) and len(ans) < 80
-    if typ == TaskType.SENTIMENT: return bool(sentiment_label(ans, prompt))
-    if typ in {TaskType.CODE_GEN, TaskType.CODE_DEBUG}: return 'def ' in ans or 'Bug:' in ans
-    if typ == TaskType.LOGIC: return '=' in ans and len(ans) < 300
-    return False
+
+def _remove_thinking(text: str) -> str:
+    text = text.strip()
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.IGNORECASE | re.DOTALL).strip()
+    if "</think>" in text.lower():
+        parts = re.split(r"</think>", text, flags=re.IGNORECASE)
+        text = parts[-1].strip()
+    if text.lower().startswith("<think>"):
+        # Prefer an explicit final answer marker if present.
+        m = re.search(r"(?:final answer|answer)\s*:\s*(.*)$", text, flags=re.IGNORECASE | re.DOTALL)
+        if m:
+            return m.group(1).strip()
+        chunks = re.split(r"\n\s*\n", text, maxsplit=1)
+        text = chunks[1].strip() if len(chunks) > 1 else text
+    return text
+
+
+def _strip_single_code_fence(text: str) -> str:
+    m = re.fullmatch(r"\s*```(?:[a-zA-Z0-9_+\-.#]*)?\s*\n(?P<code>.*?)\n```\s*", text, flags=re.DOTALL)
+    if m:
+        return m.group("code").strip()
+    return text

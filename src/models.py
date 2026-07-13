@@ -1,67 +1,135 @@
+"""Dynamic model selection from ALLOWED_MODELS.
+
+The judging harness injects ALLOWED_MODELS. This module never invents a model id.
+For v5, correctness is the priority, so large/reasoning-capable models are not
+penalized by default. We still keep non-text models out.
+"""
+
 from __future__ import annotations
 
-import os
 import re
 from .classifier import TaskType
 
+_BAD_MODEL_HINTS = (
+    "embedding", "embed", "rerank", "whisper", "audio", "tts", "image", "vision",
+    "moderation", "guard", "clip", "stable-diffusion", "diffusion", "flux",
+)
+_THINKING_HINTS = ("deepseek-r1", "r1", "reasoning", "reasoner", "thinking")
+
+
 def parse_allowed_models(raw: str) -> list[str]:
-    return [m.strip() for m in raw.replace('\n', ',').split(',') if m.strip()]
+    models = [m.strip() for m in raw.replace("\n", ",").split(",") if m.strip()]
+    return list(dict.fromkeys(models))
 
-def is_reasoning_model(model_id: str) -> bool:
-    m = model_id.lower()
-    return any(x in m for x in ['r1', 'reason', 'thinking', 'qwq', 'o1', 'o3'])
 
-def ranked_models(models: list[str], task_type: TaskType | None = None) -> list[str]:
-    # Default: trust harness order if requested. It is often curated by organizers.
-    if os.getenv('MODEL_ORDER', 'hybrid').lower() == 'harness':
-        return models[:]
-    indexed = {m: i for i, m in enumerate(models)}
-    return sorted(models, key=lambda m: (_score(m, task_type), -indexed.get(m, 0)), reverse=True)
+def ranked_models(models: list[str], task_type: TaskType) -> list[str]:
+    if not models:
+        return []
+    usable = [m for m in models if not any(bad in m.lower() for bad in _BAD_MODEL_HINTS)]
+    if not usable:
+        usable = models[:]
+    return sorted(usable, key=lambda m: _score_model(m, task_type), reverse=True)
 
-def best_model(models: list[str], task_type: TaskType | None = None) -> str:
-    ranked = ranked_models(models, task_type)
-    if not ranked:
-        raise RuntimeError('ALLOWED_MODELS is empty')
-    return ranked[0]
 
-def secondary_models(models: list[str], task_type: TaskType | None = None, limit: int = 2) -> list[str]:
-    ranked = ranked_models(models, task_type)
-    return ranked[:max(1, limit)]
-
-def _b_size(model: str) -> float:
-    vals = []
-    for m in re.finditer(r'(\d+(?:\.\d+)?)\s*b', model.lower()):
-        try: vals.append(float(m.group(1)))
-        except Exception: pass
+def _largest_b_size(model_id: str) -> float:
+    vals: list[float] = []
+    for match in re.finditer(r"(\d+(?:\.\d+)?)\s*b", model_id.lower()):
+        try:
+            vals.append(float(match.group(1)))
+        except ValueError:
+            pass
     return max(vals) if vals else 0.0
 
-def _score(model: str, task_type: TaskType | None) -> float:
-    m = model.lower()
-    s = 0.0
-    if any(x in m for x in ['embed', 'embedding', 'rerank', 'guard', 'whisper', 'audio', 'vision']):
-        return -100000
-    if 'instruct' in m: s += 300
-    if 'chat' in m: s += 150
-    if 'base' in m: s -= 1000
-    s += min(_b_size(m), 405) * 2
-    # Family priors for common Fireworks models.
-    for hint, val in [
-        ('gpt-oss-120b', 900), ('gpt-oss', 520), ('kimi-k2', 880), ('kimi', 560),
-        ('qwen3-235', 860), ('qwen3-30', 520), ('qwen3', 620), ('qwen2.5-72', 620), ('qwen2p5-72', 620), ('qwen', 460),
-        ('deepseek-v3', 800), ('deepseek-r1', 760), ('deepseek', 520),
-        ('llama-v3p3-70b', 600), ('llama-3.3-70', 600), ('llama-v3.1-405', 760), ('llama', 360),
-        ('mistral-large', 460), ('mixtral', 300), ('gemma', 260),
+
+def _score_model(model_id: str, task_type: TaskType) -> float:
+    m = model_id.lower()
+    score = 0.0
+
+    # Prefer chat/instruction tuned models and larger models.
+    for hint, value in [
+        ("instruct", 90), ("chat", 70), ("turbo", 15), ("base", -160), ("pretrain", -160),
+        ("draft", -50), ("preview", -5),
     ]:
-        if hint in m: s += val
+        if hint in m:
+            score += value
+
+    size_b = _largest_b_size(m)
+    if size_b:
+        score += min(size_b, 500) / 2.2
+
+    family_bonus = {
+        "gpt-oss-120b": 170,
+        "gpt-oss": 130,
+        "qwen3-coder": 145,
+        "qwen2.5-coder": 128,
+        "qwen2p5-coder": 128,
+        "qwen3": 128,
+        "qwen2.5": 112,
+        "qwen2p5": 112,
+        "qwen": 92,
+        "deepseek-r1": 125,
+        "deepseek-v3": 124,
+        "deepseek": 95,
+        "llama-4": 105,
+        "llama-v4": 105,
+        "llama-v3.3": 92,
+        "llama-v3p3": 92,
+        "llama-v3.1": 82,
+        "llama-v3p1": 82,
+        "llama": 70,
+        "kimi-k2": 120,
+        "kimi": 92,
+        "mixtral": 62,
+        "mistral-large": 78,
+        "mistral": 58,
+        "gemma": 55,
+    }
+    for hint, value in family_bonus.items():
+        if hint in m:
+            score += value
+
     if task_type in {TaskType.CODE_GEN, TaskType.CODE_DEBUG}:
-        if any(x in m for x in ['coder', 'code']): s += 900
-        if 'qwen' in m: s += 300
-        if 'deepseek' in m: s += 260
-        if is_reasoning_model(m): s += 60
+        if "coder" in m or "code" in m:
+            score += 180
+        if "qwen" in m:
+            score += 82
+        if "deepseek" in m:
+            score += 72
+        if "gpt-oss" in m:
+            score += 55
     elif task_type in {TaskType.MATH, TaskType.LOGIC}:
-        if is_reasoning_model(m): s += 420
-        if 'qwen' in m: s += 260
-        if 'deepseek' in m: s += 260
+        if any(h in m for h in _THINKING_HINTS):
+            score += 90
+        if "qwen" in m:
+            score += 92
+        if "gpt-oss" in m:
+            score += 86
+        if "deepseek" in m:
+            score += 80
+        if "llama" in m:
+            score += 48
+    elif task_type in {TaskType.NER, TaskType.SUMMARY, TaskType.SENTIMENT}:
+        if "gpt-oss" in m:
+            score += 90
+        if "llama" in m:
+            score += 72
+        if "qwen" in m:
+            score += 68
+        if "deepseek" in m:
+            score += 56
     else:
-        if is_reasoning_model(m): s -= 160
-    return s
+        if "gpt-oss" in m:
+            score += 88
+        if "qwen" in m:
+            score += 72
+        if "deepseek" in m:
+            score += 70
+        if "llama" in m:
+            score += 66
+
+    return score
+
+
+def is_thinking_model(model_id: str) -> bool:
+    m = model_id.lower()
+    return any(h in m for h in _THINKING_HINTS)
